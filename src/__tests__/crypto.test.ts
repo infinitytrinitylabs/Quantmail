@@ -17,16 +17,19 @@ describe("Crypto Utils", () => {
   });
 
   describe("generateBiometricHash", () => {
-    it("should generate a non-empty hash", () => {
-      const hash = generateBiometricHash("test-data");
-      expect(hash).toBeTruthy();
-      expect(hash.length).toBeGreaterThan(0);
+    it("should return hash and salt", () => {
+      const result = generateBiometricHash("test-data");
+      expect(result.hash).toBeTruthy();
+      expect(result.hash.length).toBeGreaterThan(0);
+      expect(result.salt).toBeTruthy();
+      expect(result.salt.length).toBeGreaterThan(0);
     });
 
     it("should generate unique hashes due to salt", () => {
-      const hash1 = generateBiometricHash("test-data");
-      const hash2 = generateBiometricHash("test-data");
-      expect(hash1).not.toBe(hash2);
+      const r1 = generateBiometricHash("test-data");
+      const r2 = generateBiometricHash("test-data");
+      expect(r1.hash).not.toBe(r2.hash);
+      expect(r1.salt).not.toBe(r2.salt);
     });
   });
 });

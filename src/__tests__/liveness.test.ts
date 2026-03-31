@@ -30,6 +30,7 @@ describe("Liveness Service", () => {
     const r2 = performLivenessCheck("facial_matrix:liveness_grid:depth_map");
     // Biometric hashes use random salt, so they should differ
     expect(r1.biometricHash).not.toBe(r2.biometricHash);
+    expect(r1.biometricSalt).not.toBe(r2.biometricSalt);
     // But facial matrix hashes are deterministic
     expect(r1.facialMatrixHash).toBe(r2.facialMatrixHash);
   });

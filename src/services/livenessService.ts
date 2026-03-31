@@ -5,6 +5,7 @@ export interface LivenessCheckResult {
   livenessScore: number;
   facialMatrixHash: string;
   biometricHash: string;
+  biometricSalt: string;
   reason?: string;
 }
 
@@ -21,6 +22,7 @@ export function performLivenessCheck(facialMatrixData: string): LivenessCheckRes
       livenessScore: 0,
       facialMatrixHash: "",
       biometricHash: "",
+      biometricSalt: "",
       reason: "EMPTY_FACIAL_DATA",
     };
   }
@@ -36,13 +38,14 @@ export function performLivenessCheck(facialMatrixData: string): LivenessCheckRes
 
   const passed = livenessScore >= 0.7;
   const facialMatrixHash = generateFacialMatrixHash(facialMatrixData);
-  const biometricHash = passed ? generateBiometricHash(facialMatrixData) : "";
+  const biometricResult = passed ? generateBiometricHash(facialMatrixData) : null;
 
   return {
     passed,
     livenessScore,
     facialMatrixHash,
-    biometricHash,
+    biometricHash: biometricResult?.hash ?? "",
+    biometricSalt: biometricResult?.salt ?? "",
     reason: passed ? undefined : "STRICT_BOT_DROP",
   };
 }
