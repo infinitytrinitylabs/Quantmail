@@ -1,6 +1,6 @@
 generator client {
   provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  output   = "../lib/generated/prisma"
 }
 
 datasource db {
@@ -15,38 +15,38 @@ enum UserRole {
 }
 
 model User {
-  id             String         @id @default(cuid())
+  id             String    @id @default(cuid())
   // NextAuth required fields
   name           String?
-  email          String         @unique
+  email          String    @unique
   emailVerified  DateTime?
   image          String?
   // App-specific fields
   displayName    String?
   password       String?
-  role           UserRole       @default(USER)
-  biometricHash  String?        @unique
-  verified       Boolean        @default(false)
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  role           UserRole  @default(USER)
+  biometricHash  String?   @unique
+  verified       Boolean   @default(false)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   // NextAuth relations
-  accounts       Account[]
-  sessions       Session[]
+  accounts Account[]
+  sessions Session[]
 
   // App relations
-  livenessGrid              LivenessGrid?
-  digitalTwin               DigitalTwin?
-  inboxMessages             InboxMessage[]
-  saccadeSessions           SaccadeSession[]
-  iotDevices                ConnectedIoTDevice[]
-  criticalAlerts            CriticalAlert[]
-  dashboardLogins           DashboardPhysicalLogin[]
-  deviceTokens              DeviceToken[]
-  livenessChallenges        LivenessChallenge[]
-  pushNotifications         PushNotification[]
-  quanttubeWatchEvents      QuanttubeWatchEvent[]
-  apiKeys                   ApiKey[]
+  apiKeys              ApiKey[]
+  livenessGrid         LivenessGrid?
+  digitalTwin          DigitalTwin?
+  inboxMessages        InboxMessage[]
+  saccadeSessions      SaccadeSession[]
+  iotDevices           ConnectedIoTDevice[]
+  criticalAlerts       CriticalAlert[]
+  dashboardLogins      DashboardPhysicalLogin[]
+  deviceTokens         DeviceToken[]
+  livenessChallenges   LivenessChallenge[]
+  pushNotifications    PushNotification[]
+  quanttubeWatchEvents QuanttubeWatchEvent[]
 }
 
 // ─── NextAuth Required Models ─────────────────────────────────────
@@ -143,7 +143,7 @@ model InboxMessage {
   body        String
   receivedAt  DateTime @default(now())
 
-  user           User                  @relation(fields: [userId], references: [id])
+  user           User            @relation(fields: [userId], references: [id])
   criticalAlerts CriticalAlert[]
 }
 
@@ -161,12 +161,12 @@ model ShadowInbox {
 // ─── Saccade Liveness (Quantedits Integration) ───────────────────
 
 model SaccadeSession {
-  id              String   @id @default(uuid())
-  userId          String
-  saccadeHash     String
-  sampleCount     Int
-  entropyScore    Float
-  recordedAt      DateTime @default(now())
+  id           String   @id @default(uuid())
+  userId       String
+  saccadeHash  String
+  sampleCount  Int
+  entropyScore Float
+  recordedAt   DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id])
 }
@@ -285,19 +285,19 @@ model DeviceToken {
 }
 
 model LivenessChallenge {
-  id               String          @id @default(uuid())
-  userId           String
-  status           ChallengeStatus @default(PENDING)
-  createdAt        DateTime        @default(now())
-  updatedAt        DateTime        @updatedAt
-  expiresAt        DateTime
-  quantadsTarget   String          @default("quantads://campaign/identity-check")
-  quantchatTitle   String          @default("Quantchat SDK Warning")
-  quantchatBody    String          @default("Biometric liveness token ignored. Open to resolve.")
-  escalatedAt      DateTime?
-  satisfiedAt      DateTime?
-  lastPushAt       DateTime?
-  ssoToken         String?
+  id             String          @id @default(uuid())
+  userId         String
+  status         ChallengeStatus @default(PENDING)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  expiresAt      DateTime
+  quantadsTarget String          @default("quantads://campaign/identity-check")
+  quantchatTitle String          @default("Quantchat SDK Warning")
+  quantchatBody  String          @default("Biometric liveness token ignored. Open to resolve.")
+  escalatedAt    DateTime?
+  satisfiedAt    DateTime?
+  lastPushAt     DateTime?
+  ssoToken       String?
 
   user          User               @relation(fields: [userId], references: [id])
   notifications PushNotification[]
@@ -307,21 +307,21 @@ model LivenessChallenge {
 }
 
 model PushNotification {
-  id              String               @id @default(uuid())
-  userId          String
-  challengeId     String?
-  title           String
-  body            String
-  payload         String
-  priority        NotificationPriority @default(NORMAL)
-  status          NotificationStatus   @default(QUEUED)
-  channel         String               @default("quantchat-warning")
-  createdAt       DateTime             @default(now())
-  dispatchedAt    DateTime?
-  acknowledgedAt  DateTime?
+  id             String               @id @default(uuid())
+  userId         String
+  challengeId    String?
+  title          String
+  body           String
+  payload        String
+  priority       NotificationPriority @default(NORMAL)
+  status         NotificationStatus   @default(QUEUED)
+  channel        String               @default("quantchat-warning")
+  createdAt      DateTime             @default(now())
+  dispatchedAt   DateTime?
+  acknowledgedAt DateTime?
 
-  user      User                @relation(fields: [userId], references: [id])
-  challenge LivenessChallenge?  @relation(fields: [challengeId], references: [id])
+  user      User               @relation(fields: [userId], references: [id])
+  challenge LivenessChallenge? @relation(fields: [challengeId], references: [id])
 
   @@index([userId])
   @@index([challengeId])
