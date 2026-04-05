@@ -67,7 +67,7 @@ export async function pushRoutes(app: FastifyInstance): Promise<void> {
       expiresInMinutes?: number;
     };
   }>("/push/challenge/create", async (request, reply) => {
-    const { userId, ssoToken, quantadsTarget, quantchatTitle, quantchatBody, expiresInMinutes: expiresInMinutesRaw } =
+    const { userId, ssoToken, quantadsTarget, quantchatTitle, quantchatBody, expiresInMinutes } =
       PushChallengeCreateBodySchema.parse(request.body);
 
     const user = await prisma.user.findUnique({
@@ -78,8 +78,7 @@ export async function pushRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: "User not found" });
     }
 
-    const expiresInMinutes = expiresInMinutesRaw ?? 180;
-    const expiresAt = new Date(Date.now() + expiresInMinutes * 60_000);
+    const expiresAt = new Date(Date.now() + (expiresInMinutes ?? 180) * 60_000);
 
     const challenge = await prisma.livenessChallenge.create({
       data: {

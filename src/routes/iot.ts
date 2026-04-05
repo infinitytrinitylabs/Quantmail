@@ -127,16 +127,16 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
       sessionMinutes?: number;
     };
   }>("/iot/dashboard/physical-login", async (request, reply) => {
-    const { userId, dashboardOrigin, deviceProof, proofTimestamp, sessionMinutes: rawMinutes } =
+    const { userId, dashboardOrigin, deviceProof, proofTimestamp, sessionMinutes } =
       IotPhysicalLoginBodySchema.parse(request.body);
 
     if (!verifyDeviceProof(deviceProof, userId, dashboardOrigin, proofTimestamp)) {
       return reply.code(403).send({ error: "INVALID_DEVICE_PROOF" });
     }
 
-    const sessionMinutes = Math.max(
+    const clampedSessionMinutes = Math.max(
       MIN_PHYSICAL_SESSION_MINUTES,
-      Math.min(MAX_PHYSICAL_SESSION_MINUTES, rawMinutes ?? 15)
+      Math.min(MAX_PHYSICAL_SESSION_MINUTES, sessionMinutes ?? 15)
     );
 
     const session = await prisma.dashboardPhysicalLogin.create({
@@ -146,7 +146,7 @@ export async function iotRoutes(app: FastifyInstance): Promise<void> {
         loginMethod: "PHYSICAL",
         deviceProof,
         expiresAt: new Date(
-          Date.now() + sessionMinutes * MILLISECONDS_PER_MINUTE
+          Date.now() + clampedSessionMinutes * MILLISECONDS_PER_MINUTE
         ),
       },
     });
