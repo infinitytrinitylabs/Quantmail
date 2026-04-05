@@ -1,5 +1,6 @@
 import CryptoJS from "crypto-js";
 import { v4 as uuidv4 } from "uuid";
+import argon2 from "argon2";
 
 /**
  * Derives a deterministic biometric hash from a facial matrix payload.
@@ -50,5 +51,28 @@ export function verifyMasterSSOToken(
     return parsed.sub;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Hashes a secret (password, API key, etc.) using Argon2id.
+ * Always use this instead of plain SHA-256 for secrets at rest.
+ */
+export async function hashSecret(secret: string): Promise<string> {
+  return argon2.hash(secret, { type: argon2.argon2id });
+}
+
+/**
+ * Verifies a plain-text secret against an Argon2 hash.
+ * Returns true if they match.
+ */
+export async function verifySecret(
+  hash: string,
+  secret: string
+): Promise<boolean> {
+  try {
+    return await argon2.verify(hash, secret);
+  } catch {
+    return false;
   }
 }
