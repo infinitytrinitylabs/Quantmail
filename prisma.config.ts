@@ -7,7 +7,9 @@ export default defineConfig({
   migrate: {
     async datasource() {
       return {
-        url: "file:./dev.db",
+        url:
+          process.env["DATABASE_URL"] ??
+          "postgresql://quantmail:quantmail@localhost:5432/quantmail",
       };
     },
   },
