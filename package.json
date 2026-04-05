@@ -23,6 +23,7 @@
     "better-sqlite3": "^12.8.0",
     "crypto-js": "^4.2.0",
     "fastify": "^5.8.4",
+    "openai": "^6.33.0",
     "uuid": "^13.0.0"
   },
   "devDependencies": {
