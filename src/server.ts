@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import fs from "node:fs";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import helmet from "@fastify/helmet";
@@ -17,16 +16,16 @@ import { orchestratorRoutes } from "./routes/orchestrator";
 import { tasksRoutes } from "./routes/tasks";
 import { chatRoutes } from "./routes/chat";
 import { notesRoutes } from "./routes/notes";
+import { mailRoutes } from "./routes/mail";
 import { calendarRoutes } from "./routes/calendar";
 import { docsRoutes } from "./routes/docs";
 import { sheetsRoutes } from "./routes/sheets";
 import { driveRoutes } from "./routes/drive";
 import { meetRoutes } from "./routes/meet";
 import { prisma } from "./db";
+import { landingPage } from "./landing";
 
-function buildHttpsOptions():
-  | { key: string; cert: string; ca?: string }
-  | undefined {
+function buildHttpsOptions(): { key: string; cert: string; ca?: string } | undefined {
   const keyPath = process.env["TLS_KEY_PATH"];
   const certPath = process.env["TLS_CERT_PATH"];
   if (!keyPath || !certPath) return undefined;
@@ -111,13 +110,13 @@ async function main(): Promise<void> {
   await app.register(tasksRoutes);
   await app.register(chatRoutes);
   await app.register(notesRoutes);
+  await app.register(mailRoutes);
   await app.register(calendarRoutes);
   await app.register(docsRoutes);
   await app.register(sheetsRoutes);
   await app.register(driveRoutes);
   await app.register(meetRoutes);
 
-  // Health check – verifies DB connectivity
   app.get(
     "/health",
     {
@@ -170,6 +169,8 @@ async function main(): Promise<void> {
       return reply.code(dbStatus === "ok" ? 200 : 503).send(payload);
     }
   );
+
+  app.get("/", async (_request, reply) => reply.type("text/html").send(landingPage));
 
   const port = parseInt(process.env["PORT"] || "3000", 10);
   await app.listen({ port, host: "0.0.0.0" });

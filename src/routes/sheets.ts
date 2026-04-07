@@ -1,12 +1,8 @@
+import { randomUUID } from "crypto";
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
-import { randomUUID } from "crypto";
 
 export async function sheetsRoutes(app: FastifyInstance): Promise<void> {
-  /**
-   * GET /sheets/:userId
-   * Returns all sheets for a user.
-   */
   app.get<{ Params: { userId: string } }>("/sheets/:userId", async (request, reply) => {
     const { userId } = request.params;
     const sheets = await prisma.sheet.findMany({
@@ -16,35 +12,40 @@ export async function sheetsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ sheets });
   });
 
-  /**
-   * POST /sheets
-   * Creates a new sheet.
-   */
+  app.get<{ Params: { userId: string; id: string } }>("/sheets/:userId/:id", async (request, reply) => {
+    const { userId, id } = request.params;
+    const sheet = await prisma.sheet.findFirst({ where: { id, userId } });
+    if (!sheet) {
+      return reply.code(404).send({ error: "Sheet not found" });
+    }
+    return reply.send({ sheet });
+  });
+
   app.post<{
-    Body: { userId: string; title: string; data?: string };
+    Body: { userId: string; title: string; data?: string; dataJson?: string };
   }>("/sheets", async (request, reply) => {
-    const { userId, title, data = "[]" } = request.body;
+    const { userId, title, data, dataJson } = request.body;
 
     if (!userId || !title) {
       return reply.code(400).send({ error: "userId and title are required" });
     }
 
-    const sheet = await prisma.sheet.create({ data: { userId, title, data } });
+    const sheet = await prisma.sheet.create({
+      data: { userId, title, data: data ?? dataJson ?? "[]" },
+    });
     return reply.code(201).send({ sheet });
   });
 
-  /**
-   * PUT /sheets/:id
-   * Updates a sheet.
-   */
   app.put<{
     Params: { id: string };
-    Body: { title?: string; data?: string };
+    Body: { userId?: string; title?: string; data?: string; dataJson?: string };
   }>("/sheets/:id", async (request, reply) => {
     const { id } = request.params;
-    const { title, data } = request.body;
+    const { userId, title, data, dataJson } = request.body;
 
-    const existing = await prisma.sheet.findUnique({ where: { id } });
+    const existing = userId
+      ? await prisma.sheet.findFirst({ where: { id, userId } })
+      : await prisma.sheet.findUnique({ where: { id } });
     if (!existing) {
       return reply.code(404).send({ error: "Sheet not found" });
     }
@@ -54,32 +55,28 @@ export async function sheetsRoutes(app: FastifyInstance): Promise<void> {
       data: {
         ...(title !== undefined && { title }),
         ...(data !== undefined && { data }),
+        ...(dataJson !== undefined && { data: dataJson }),
       },
     });
 
     return reply.send({ sheet });
   });
 
-  /**
-   * DELETE /sheets/:id
-   * Deletes a sheet.
-   */
-  app.delete<{ Params: { id: string } }>("/sheets/:id", async (request, reply) => {
+  app.delete<{ Params: { id: string }; Body: { userId?: string } }>("/sheets/:id", async (request, reply) => {
     const { id } = request.params;
+    const userId = request.body?.userId;
 
-    const existing = await prisma.sheet.findUnique({ where: { id } });
+    const existing = userId
+      ? await prisma.sheet.findFirst({ where: { id, userId } })
+      : await prisma.sheet.findUnique({ where: { id } });
     if (!existing) {
       return reply.code(404).send({ error: "Sheet not found" });
     }
 
     await prisma.sheet.delete({ where: { id } });
-    return reply.code(204).send();
+    return reply.send({ status: "deleted" });
   });
 
-  /**
-   * POST /sheets/:id/share
-   * Generates a public share token for a sheet.
-   */
   app.post<{ Params: { id: string } }>("/sheets/:id/share", async (request, reply) => {
     const { id } = request.params;
 
@@ -97,10 +94,6 @@ export async function sheetsRoutes(app: FastifyInstance): Promise<void> {
     return reply.send({ shareToken: sheet.shareToken, shareUrl: `/sheets/share/${sheet.shareToken}` });
   });
 
-  /**
-   * GET /sheets/share/:shareToken
-   * Returns a read-only public view of a shared sheet.
-   */
   app.get<{ Params: { shareToken: string } }>("/sheets/share/:shareToken", async (request, reply) => {
     const { shareToken } = request.params;
 
