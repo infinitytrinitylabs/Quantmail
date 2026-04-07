@@ -24,6 +24,11 @@ model User {
   verified       Boolean        @default(false)
   role           UserRole       @default(FREE)
   aiCount        Int            @default(0)
+  openaiKey      String?
+  anthropicKey   String?
+  geminiKey      String?
+  customModelUrl String?
+  customModelKey String?
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 
@@ -439,4 +444,18 @@ model WebhookEndpoint {
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+// ─── Admin Global Configuration (BYOK / Custom Model) ────────────
+
+model AdminConfig {
+  id                 String   @id @default(uuid())
+  globalOpenaiKey    String?
+  globalAnthropicKey String?
+  globalGeminiKey    String?
+  customModelUrl     String?
+  customModelKey     String?
+  updatedBy          String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 }

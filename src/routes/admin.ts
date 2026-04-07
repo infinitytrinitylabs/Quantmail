@@ -1,7 +1,7 @@
 /**
  * Admin Dashboard API
  *
- * Endpoints for system stats and user management.
+ * Endpoints for system stats, user management, and global AI configuration.
  * All routes require a valid SSO token with the ADMIN role.
  */
 
@@ -9,12 +9,14 @@ import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
 import { requireAdmin } from "../middleware/authMiddleware";
 import type { AuthenticatedUser } from "../middleware/authMiddleware";
+import { encryptApiKey } from "../utils/crypto";
+import { maskStoredKey } from "../utils/maskKey";
+import { createRateLimiter } from "../utils/rateLimit";
+
+const ENCRYPTION_SECRET = process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+const rateLimiter = createRateLimiter({ max: 10 });
 
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
-  /**
-   * GET /admin/stats
-   * Returns system-level statistics.
-   */
   app.get("/admin/stats", {
     preHandler: requireAdmin,
     handler: async (_request, reply) => {
@@ -52,23 +54,14 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  /**
-   * GET /admin/users
-   * Lists all users with pagination support.
-   * Query params: page (default 1), limit (default 20, max 100).
-   */
   app.get<{
     Querystring: { page?: string; limit?: string; role?: string };
   }>("/admin/users", {
     preHandler: requireAdmin,
     handler: async (request, reply) => {
       const page = Math.max(1, parseInt(request.query.page || "1", 10));
-      const limit = Math.min(
-        100,
-        Math.max(1, parseInt(request.query.limit || "20", 10))
-      );
+      const limit = Math.min(100, Math.max(1, parseInt(request.query.limit || "20", 10)));
       const roleFilter = request.query.role as "USER" | "ADMIN" | undefined;
-
       const where = roleFilter ? { role: roleFilter } : {};
 
       const [users, total] = await Promise.all([
@@ -102,10 +95,6 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  /**
-   * GET /admin/users/:id
-   * Returns detailed information for a specific user.
-   */
   app.get<{ Params: { id: string } }>("/admin/users/:id", {
     preHandler: requireAdmin,
     handler: async (request, reply) => {
@@ -150,10 +139,6 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  /**
-   * PATCH /admin/users/:id/role
-   * Updates a user's role (USER or ADMIN).
-   */
   app.patch<{
     Params: { id: string };
     Body: { role: "USER" | "ADMIN" };
@@ -164,20 +149,12 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       const { role } = request.body;
 
       if (!role || !["USER", "ADMIN"].includes(role)) {
-        return reply
-          .code(400)
-          .send({ error: "role must be USER or ADMIN" });
+        return reply.code(400).send({ error: "role must be USER or ADMIN" });
       }
 
-      const requester = (
-        request as typeof request & { user: AuthenticatedUser }
-      ).user;
-
-      // Prevent admins from demoting themselves.
+      const requester = (request as typeof request & { user: AuthenticatedUser }).user;
       if (requester.id === id && role !== "ADMIN") {
-        return reply
-          .code(400)
-          .send({ error: "Cannot remove your own admin role" });
+        return reply.code(400).send({ error: "Cannot remove your own admin role" });
       }
 
       const existing = await prisma.user.findUnique({ where: { id } });
@@ -195,19 +172,11 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  /**
-   * DELETE /admin/users/:id
-   * Deletes a user account and all associated data.
-   * Prevents admins from deleting themselves.
-   */
   app.delete<{ Params: { id: string } }>("/admin/users/:id", {
     preHandler: requireAdmin,
     handler: async (request, reply) => {
       const { id } = request.params;
-
-      const requester = (
-        request as typeof request & { user: AuthenticatedUser }
-      ).user;
+      const requester = (request as typeof request & { user: AuthenticatedUser }).user;
 
       if (requester.id === id) {
         return reply.code(400).send({ error: "Cannot delete your own account" });
@@ -223,20 +192,13 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  /**
-   * GET /admin/shadow-inbox
-   * Returns recent shadow inbox entries with pagination.
-   */
   app.get<{
     Querystring: { page?: string; limit?: string };
   }>("/admin/shadow-inbox", {
     preHandler: requireAdmin,
     handler: async (request, reply) => {
       const page = Math.max(1, parseInt(request.query.page || "1", 10));
-      const limit = Math.min(
-        100,
-        Math.max(1, parseInt(request.query.limit || "20", 10))
-      );
+      const limit = Math.min(100, Math.max(1, parseInt(request.query.limit || "20", 10)));
 
       const [entries, total] = await Promise.all([
         prisma.shadowInbox.findMany({
@@ -250,6 +212,99 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
       return reply.send({
         entries,
         pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
+      });
+    },
+  });
+
+  app.post<{
+    Body: {
+      globalOpenaiKey?: string;
+      globalAnthropicKey?: string;
+      globalGeminiKey?: string;
+      customModelUrl?: string;
+      customModelKey?: string;
+    };
+  }>("/admin/config", {
+    preHandler: requireAdmin,
+    handler: async (request, reply) => {
+      if (!rateLimiter.check(request.ip)) {
+        return reply.code(429).send({ error: "Rate limit exceeded" });
+      }
+
+      const requester = (request as typeof request & { user: AuthenticatedUser }).user;
+      const {
+        globalOpenaiKey,
+        globalAnthropicKey,
+        globalGeminiKey,
+        customModelUrl,
+        customModelKey,
+      } = request.body;
+
+      const updateData: Record<string, string | null> = {};
+      if (globalOpenaiKey !== undefined) {
+        updateData.globalOpenaiKey = globalOpenaiKey ? encryptApiKey(globalOpenaiKey, ENCRYPTION_SECRET) : null;
+      }
+      if (globalAnthropicKey !== undefined) {
+        updateData.globalAnthropicKey = globalAnthropicKey ? encryptApiKey(globalAnthropicKey, ENCRYPTION_SECRET) : null;
+      }
+      if (globalGeminiKey !== undefined) {
+        updateData.globalGeminiKey = globalGeminiKey ? encryptApiKey(globalGeminiKey, ENCRYPTION_SECRET) : null;
+      }
+      if (customModelUrl !== undefined) {
+        updateData.customModelUrl = customModelUrl || null;
+      }
+      if (customModelKey !== undefined) {
+        updateData.customModelKey = customModelKey ? encryptApiKey(customModelKey, ENCRYPTION_SECRET) : null;
+      }
+
+      if (Object.keys(updateData).length === 0) {
+        return reply.code(400).send({ error: "At least one configuration field is required" });
+      }
+
+      const existing = await prisma.adminConfig.findFirst({ orderBy: { updatedAt: "desc" } });
+      const config = existing
+        ? await prisma.adminConfig.update({
+            where: { id: existing.id },
+            data: { ...updateData, updatedBy: requester.id },
+          })
+        : await prisma.adminConfig.create({
+            data: { ...updateData, updatedBy: requester.id },
+          });
+
+      return reply.send({
+        message: "Global AI configuration updated successfully.",
+        configId: config.id,
+        updatedAt: config.updatedAt,
+      });
+    },
+  });
+
+  app.get("/admin/config", {
+    preHandler: requireAdmin,
+    handler: async (request, reply) => {
+      if (!rateLimiter.check(request.ip)) {
+        return reply.code(429).send({ error: "Rate limit exceeded" });
+      }
+
+      const config = await prisma.adminConfig.findFirst({ orderBy: { updatedAt: "desc" } });
+      if (!config) {
+        return reply.send({
+          config: null,
+          message: "No global configuration set. Use POST /admin/config to configure.",
+        });
+      }
+
+      return reply.send({
+        config: {
+          id: config.id,
+          globalOpenaiKey: maskStoredKey(config.globalOpenaiKey),
+          globalAnthropicKey: maskStoredKey(config.globalAnthropicKey),
+          globalGeminiKey: maskStoredKey(config.globalGeminiKey),
+          customModelUrl: config.customModelUrl || null,
+          customModelKey: maskStoredKey(config.customModelKey),
+          updatedBy: config.updatedBy,
+          updatedAt: config.updatedAt,
+        },
       });
     },
   });
