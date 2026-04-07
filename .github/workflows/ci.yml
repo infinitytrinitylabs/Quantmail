@@ -2,9 +2,14 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
   push:
-    branches: [main, develop]
+    branches:
+      - main
+      - develop
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -31,21 +36,13 @@ jobs:
         run: npm ci
 
       - name: Generate Prisma client
-        run: node_modules/.bin/prisma generate
+        run: npx prisma generate
 
       - name: Lint (type-check)
         run: npm run lint
 
       - name: Build
-        run: node_modules/.bin/tsc
+        run: npm run build
 
       - name: Run tests
         run: npm run test
-
-      - name: Upload coverage (if present)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: coverage/
-          if-no-files-found: ignore
