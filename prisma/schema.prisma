@@ -12,6 +12,8 @@ datasource db {
 enum UserRole {
   FREE
   PRO
+  USER
+  ADMIN
 }
 
 model User {
@@ -425,4 +427,16 @@ model DriveFile {
   updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id])
+}
+
+// ─── Webhook Subscriptions ────────────────────────────────────────
+
+model WebhookEndpoint {
+  id        String   @id @default(uuid())
+  url       String
+  secret    String
+  events    String   @default("[]")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }

@@ -24,6 +24,8 @@ import { driveRoutes } from "./routes/drive";
 import { meetRoutes } from "./routes/meet";
 import { prisma } from "./db";
 import { landingPage } from "./landing";
+import { adminRoutes } from "./routes/admin";
+import { webhookRoutes } from "./routes/webhook";
 
 function buildHttpsOptions(): { key: string; cert: string; ca?: string } | undefined {
   const keyPath = process.env["TLS_KEY_PATH"];
@@ -116,6 +118,8 @@ async function main(): Promise<void> {
   await app.register(sheetsRoutes);
   await app.register(driveRoutes);
   await app.register(meetRoutes);
+  await app.register(adminRoutes);
+  await app.register(webhookRoutes);
 
   app.get(
     "/health",
