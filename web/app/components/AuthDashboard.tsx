@@ -223,7 +223,7 @@ interface AuditEventRowProps {
 }
 
 function AuditEventRow({ event }: AuditEventRowProps) {
-  const isLock = event.eventType.includes("LOCK") || event.eventType.includes("LOCK");
+  const isLock = event.eventType.includes("LOCK") || event.eventType.includes("LOCKED");
   const isAnomaly = event.eventType.includes("ANOMALY");
 
   const iconClass = isLock

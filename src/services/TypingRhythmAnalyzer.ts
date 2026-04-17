@@ -33,6 +33,9 @@ const ANOMALY_DURATION_MS = 30_000;
 /** Maximum number of keystroke events retained per user profile. */
 const MAX_PROFILE_EVENTS = 5_000;
 
+/** Maximum inter-key pause (ms) allowed within a digraph; longer gaps are dropped. */
+const MAX_INTER_KEY_PAUSE_MS = 5_000;
+
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 /** A single raw keystroke event captured from the browser. */
@@ -164,9 +167,8 @@ export function extractDigraphs(events: KeystrokeEvent[]): Digraph[] {
     const holdTime = Math.max(0, current.releasedAt - current.pressedAt);
     const flightTime = Math.max(0, next.pressedAt - current.releasedAt);
 
-    // Discard digraphs with implausibly long gaps (> 5 seconds) – likely
-    // pauses between words that don't reflect rhythm.
-    if (flightTime > 5_000) continue;
+    // Discard digraphs with implausibly long gaps – likely pauses between words.
+    if (flightTime > MAX_INTER_KEY_PAUSE_MS) continue;
 
     digraphs.push({ holdTime, flightTime });
   }

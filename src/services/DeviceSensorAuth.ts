@@ -272,8 +272,13 @@ export function analyseAccelerometer(samples: AccelerometerSample[]): number {
 export function analyseWebGL(fp: WebGLFingerprint | undefined): number {
   if (!fp) return 0.3;
 
+  // Normalise for case-insensitive, whitespace-tolerant comparison to prevent
+  // trivial spoofing bypasses (e.g. 'Unknown', 'UNKNOWN', ' unknown ').
+  const renderer = fp.renderer.trim().toLowerCase();
+  const vendor = fp.vendor.trim().toLowerCase();
+
   // Empty renderer or vendor strings indicate driver-level spoofing
-  if (!fp.renderer || fp.renderer === "unknown" || fp.vendor === "unknown") {
+  if (!renderer || renderer === "unknown" || vendor === "unknown") {
     return 0.2;
   }
 

@@ -61,6 +61,12 @@ const WEIGHTS = {
   device: 0.30,
 } as const;
 
+/**
+ * Maximum number of devices that will be auto-enrolled on first recognition.
+ * Kept intentionally small to limit the attack surface of silent enrolment.
+ */
+const AUTO_ENROLL_DEVICE_LIMIT = 3;
+
 // ─── In-memory session confidence state ──────────────────────────────────────
 
 interface SessionState {
@@ -187,6 +193,10 @@ async function logAnomalyEvent(
   details: Record<string, unknown>
 ): Promise<void> {
   try {
+    // The SecurityAuditLog model is new and the Prisma client types are
+    // regenerated during `npm run build` (prisma generate).  Until then the
+    // cast below is the minimal safe workaround; it will be removed once the
+    // generated client reflects the updated schema.
     await (prisma as unknown as {
       securityAuditLog: {
         create: (args: { data: Record<string, unknown> }) => Promise<unknown>;
@@ -271,7 +281,7 @@ export async function processTelemetry(
     // Auto-enroll device on first recognition (below max limit)
     if (!deviceResult.isKnownDevice) {
       const enrolled = getEnrolledDevices(userId);
-      if (enrolled.length < 3) {
+      if (enrolled.length < AUTO_ENROLL_DEVICE_LIMIT) {
         enrollDevice(
           userId,
           deviceResult.deviceId,

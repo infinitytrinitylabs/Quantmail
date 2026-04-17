@@ -38,6 +38,9 @@ const ANALYSIS_WINDOW_MS = 10_000;
 /** Maximum number of raw movement samples stored per user. */
 const MAX_MOVEMENT_SAMPLES = 10_000;
 
+/** Maximum milliseconds between two clicks to be counted as a double-click. */
+const DOUBLE_CLICK_THRESHOLD_MS = 300;
+
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
 /** A single pointer-movement sample captured from the browser. */
@@ -395,7 +398,7 @@ export function extractFeatureVector(
   // ── Click-to-movement ratio (56–59) ──────────────────────────────────────
   vec[56] = clicks.length / Math.max(1, movements.length);
   const doubleClicks = clicks.filter((_, i) =>
-    i > 0 && clicks[i]!.timestamp - clicks[i - 1]!.timestamp < 300
+    i > 0 && clicks[i]!.timestamp - clicks[i - 1]!.timestamp < DOUBLE_CLICK_THRESHOLD_MS
   ).length;
   vec[57] = doubleClicks / Math.max(1, clicks.length);
   // 58-59 reserved
