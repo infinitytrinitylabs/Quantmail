@@ -149,11 +149,13 @@ export async function POST(request: Request) {
         },
       });
 
-  await prisma.digitalTwin.upsert({
-    where: { userId: user.id },
-    update: {},
-    create: { userId: user.id },
-  });
+  if (existingUser) {
+    await prisma.digitalTwin.upsert({
+      where: { userId: user.id },
+      update: {},
+      create: { userId: user.id },
+    });
+  }
 
   if (challenge.biometricHash) {
     const biometricHashRecord = await prisma.biometricHash.findUnique({
