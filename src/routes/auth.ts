@@ -1,8 +1,8 @@
 import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
 import { performLivenessCheck } from "../services/livenessService";
-import { deriveBiometricHash } from "../utils/crypto";
 import {
+  deriveBiometricHash,
   generateMasterSSOToken,
   verifyMasterSSOToken,
 } from "../utils/crypto";
