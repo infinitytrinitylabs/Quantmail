@@ -37,15 +37,6 @@ import { verifyPasskeyAuthentication } from "../services/WebAuthnService";
 
 type AuthedRequest = FastifyRequest & { user: AuthenticatedUser };
 
-const VAULT_UNLOCK_RATE_LIMIT = {
-  config: {
-    rateLimit: {
-      max: 5,
-      timeWindow: "1 minute",
-    },
-  },
-} as const;
-
 interface SendBody {
   recipientEmail: string;
   subject: string;
@@ -286,7 +277,15 @@ export async function ephemeralRoutes(app: FastifyInstance): Promise<void> {
    */
   app.post<{ Body: VaultUnlockTokenBody }>(
     "/vault/unlock-token",
-    { preHandler: requireAuth, ...VAULT_UNLOCK_RATE_LIMIT },
+    {
+      preHandler: requireAuth,
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "1 minute",
+        },
+      },
+    },
     async (request, reply) => {
       const auth = (request as AuthedRequest).user;
       const body = request.body;
