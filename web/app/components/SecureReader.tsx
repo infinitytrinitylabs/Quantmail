@@ -349,14 +349,13 @@ export function SecureReader(props: SecureReaderProps) {
           return;
         }
         const data = (await res.json()) as FetchSuccess;
-        payloadRef.current = data.payload;
+        const { payload, attachments, ...rest } = data;
+        payloadRef.current = payload;
+        void attachments;
         const cryptoKey = await importAesKey(keyB64);
-        const decrypted = await decryptAesGcm(data.payload, cryptoKey);
+        const decrypted = await decryptAesGcm(payload, cryptoKey);
         plaintextRef.current = decrypted;
         setPlaintext(decrypted);
-        const { payload: _p, attachments: _a, ...rest } = data;
-        void _p;
-        void _a;
         setMeta(rest);
         setPhase("READY");
       } catch (err) {

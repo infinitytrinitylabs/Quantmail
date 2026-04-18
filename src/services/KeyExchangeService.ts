@@ -442,9 +442,9 @@ export async function rotationDashboard(ownerUserId: string): Promise<{
     select: { createdAt: true },
   });
   return {
-    active: counts["ACTIVE"] ?? 0,
-    rotated: counts["ROTATED"] ?? 0,
-    revoked: counts["REVOKED"] ?? 0,
+    active: counts["ACTIVE"],
+    rotated: counts["ROTATED"],
+    revoked: counts["REVOKED"],
     newestActiveAt: newest?.createdAt ?? null,
     oldestActiveAt: oldest?.createdAt ?? null,
   };

@@ -232,6 +232,29 @@ function hashIp(ip: string | undefined): string {
     .digest("hex");
 }
 
+/**
+ * Linear-time recipient-email sanity check.  Avoids backtracking regex
+ * patterns (e.g. `/.+@.+\..+/`) that CodeQL flags as polynomial ReDoS
+ * risks.  We just need to reject obvious garbage before hitting the DB;
+ * real RFC-5321 validation happens at the SMTP layer.
+ */
+function isValidRecipientEmail(email: string): boolean {
+  if (email.length < 3 || email.length > 254) return false;
+  const at = email.indexOf("@");
+  if (at <= 0 || at !== email.lastIndexOf("@")) return false;
+  const local = email.slice(0, at);
+  const domain = email.slice(at + 1);
+  if (local.length === 0 || domain.length < 3) return false;
+  const dot = domain.indexOf(".");
+  if (dot <= 0 || dot === domain.length - 1) return false;
+  // Reject whitespace / control characters anywhere.
+  for (let i = 0; i < email.length; i++) {
+    const c = email.charCodeAt(i);
+    if (c <= 0x20 || c === 0x7f) return false;
+  }
+  return true;
+}
+
 // ─── Destruction-policy helpers ──────────────────────────────────
 
 const TIMER_DURATIONS: Record<DestructionMode, number | null> = {
@@ -269,7 +292,7 @@ export async function send(params: SendParams): Promise<SendResult> {
   if (!params.payload) {
     throw new Error("payload is required");
   }
-  if (!params.recipientEmail || !/.+@.+\..+/.test(params.recipientEmail)) {
+  if (!params.recipientEmail || !isValidRecipientEmail(params.recipientEmail)) {
     throw new Error("recipientEmail must be a valid email address");
   }
   validatePayload(params.payload);
@@ -504,16 +527,20 @@ export async function secureDestroy(
  * BullMQ scheduler.  Returns the number of rows shredded.
  */
 export async function purgeDestroyed(now: Date = new Date()): Promise<number> {
+  // Messages whose destruction condition has been recorded: either their
+  // timer elapsed, the sender revoked the pair, or `fetchForRead` already
+  // marked them READ after the last allowed read.  The final shredding
+  // (overwrite + hard-delete) happens in `secureDestroy` below.
   const expired = await prisma.ephemeralMessage.findMany({
     where: {
-      state: { in: ["ACTIVE", "READ", "EXPIRED", "REVOKED"] },
       OR: [
-        { expiresAt: { lte: now } },
         { state: "EXPIRED" },
         { state: "REVOKED" },
         {
-          state: "READ",
-          readCount: { gte: prisma.ephemeralMessage.fields.maxReads },
+          AND: [
+            { state: { in: ["ACTIVE", "READ"] } },
+            { expiresAt: { not: null, lte: now } },
+          ],
         },
       ],
     },
