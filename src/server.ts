@@ -6,6 +6,7 @@ import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { authRoutes } from "./routes/auth";
+import { profileRoutes } from "./routes/profile";
 import { inboxRoutes } from "./routes/inbox";
 import { digitalTwinRoutes } from "./routes/digitalTwin";
 import { iotRoutes } from "./routes/iot";
@@ -28,6 +29,8 @@ import { webhookRoutes } from "./routes/webhook";
 import { superAppRoutes } from "./routes/superapp";
 import { smartReplyRoutes } from "./routes/smartReply";
 import { streakRoutes } from "./routes/streak";
+import { ephemeralRoutes } from "./routes/ephemeral";
+import { tokenValidatorRoutes } from "./services/TokenValidator";
 import { prisma } from "./db";
 import { landingPage } from "./landing";
 
@@ -126,6 +129,9 @@ async function main(): Promise<void> {
   await app.register(superAppRoutes);
   await app.register(smartReplyRoutes);
   await app.register(streakRoutes);
+  await app.register(ephemeralRoutes);
+  await app.register(tokenValidatorRoutes);
+  await app.register(profileRoutes);
 
   app.get(
     "/health",
