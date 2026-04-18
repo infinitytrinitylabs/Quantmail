@@ -266,6 +266,13 @@ const TIMER_DURATIONS: Record<DestructionMode, number | null> = {
 };
 
 /**
+ * Effective "unlimited" reads for timer-based destruction modes.  The
+ * number must be finite (DB columns are NOT NULL) but large enough that
+ * no realistic user session will exhaust it inside the timer window.
+ */
+const TIMER_MODE_MAX_READS = 1_000_000;
+
+/**
  * Computes the destruction policy from a destruction mode:
  *   – `expiresAt` is set for TIMER_* modes (relative to now).
  *   – `maxReads` is 1 for READ_ONCE / SCREENSHOT_PROOF, +∞ for timers.
@@ -276,7 +283,10 @@ export function destructionPolicy(mode: DestructionMode, now: Date = new Date())
 } {
   const ttl = TIMER_DURATIONS[mode];
   if (ttl !== null) {
-    return { expiresAt: new Date(now.getTime() + ttl), maxReads: 1_000_000 };
+    return {
+      expiresAt: new Date(now.getTime() + ttl),
+      maxReads: TIMER_MODE_MAX_READS,
+    };
   }
   return { expiresAt: null, maxReads: 1 };
 }

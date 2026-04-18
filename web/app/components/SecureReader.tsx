@@ -351,6 +351,9 @@ export function SecureReader(props: SecureReaderProps) {
         const data = (await res.json()) as FetchSuccess;
         const { payload, attachments, ...rest } = data;
         payloadRef.current = payload;
+        // Attachment ciphertext is intentionally not rendered in this
+        // iteration – the SecureReader shows the message body only; a
+        // future pass will surface downloadable encrypted attachments.
         void attachments;
         const cryptoKey = await importAesKey(keyB64);
         const decrypted = await decryptAesGcm(payload, cryptoKey);

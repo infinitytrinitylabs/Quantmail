@@ -33,6 +33,7 @@ import {
 import * as Ephemeral from "../services/EphemeralMailService";
 import * as KeyExchange from "../services/KeyExchangeService";
 import * as Vault from "../services/MessageVault";
+import { verifyPasskeyAuthentication } from "../services/WebAuthnService";
 
 type AuthedRequest = FastifyRequest & { user: AuthenticatedUser };
 
@@ -66,6 +67,17 @@ interface VaultPutBody {
 
 interface VaultOpenBody {
   unlockToken: string;
+}
+
+interface VaultUnlockTokenBody {
+  /**
+   * Fresh WebAuthn assertion response obtained via
+   * `generatePasskeyAuthenticationOptions` → browser `navigator.credentials.get()`.
+   * The underlying challenge (consumed inside `verifyPasskeyAuthentication`)
+   * has a 5-minute TTL, so this request cryptographically proves the user
+   * performed a biometric gesture within the last few minutes.
+   */
+  assertion: Parameters<typeof verifyPasskeyAuthentication>[1];
 }
 
 const VALID_DESTRUCTION_MODES: Ephemeral.DestructionMode[] = [
@@ -255,22 +267,40 @@ export async function ephemeralRoutes(app: FastifyInstance): Promise<void> {
   // ─── Vault endpoints ────────────────────────────────────────────
 
   /**
-   * Mints a 5-minute unlock token AFTER the route handler has already
-   * verified a WebAuthn assertion.  Because route-level WebAuthn
-   * verification is performed by `/auth/webauthn/authenticate/finish`
-   * (which sets a short-lived "biometric session" claim in the SSO
-   * token), we treat any caller that successfully passes `requireAuth`
-   * AND has `verified === true` as having proven biometric possession.
+   * Mints a short-lived (5-minute) unlock token.
+   *
+   * Requires a *fresh* WebAuthn assertion in the request body — we run
+   * `verifyPasskeyAuthentication` here, which consumes the pending
+   * challenge.  Because challenges are one-shot and expire in 5
+   * minutes, a stolen long-lived SSO token cannot mint vault unlock
+   * tokens without also performing a new biometric gesture.
    */
-  app.post(
+  app.post<{ Body: VaultUnlockTokenBody }>(
     "/vault/unlock-token",
     { preHandler: requireAuth },
     async (request, reply) => {
       const auth = (request as AuthedRequest).user;
+      const body = request.body;
+      if (!body || !body.assertion) {
+        return reply
+          .code(400)
+          .send({ error: "WebAuthn assertion required" });
+      }
       if (!auth.verified) {
         return reply
           .code(403)
           .send({ error: "Biometric verification required" });
+      }
+      try {
+        const result = await verifyPasskeyAuthentication(auth.id, body.assertion);
+        if (!result.verified) {
+          return reply.code(403).send({ error: "Biometric gesture rejected" });
+        }
+      } catch (err) {
+        return reply.code(403).send({
+          error: "Biometric gesture rejected",
+          reason: err instanceof Error ? err.message : "verification failed",
+        });
       }
       const token = Vault.mintUnlockToken(auth.id);
       return reply.send({ token, expiresInSeconds: 300 });
