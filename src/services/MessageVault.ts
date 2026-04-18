@@ -1,30 +1,23 @@
 /**
  * MessageVault
  *
- * Optional long-term storage for ephemeral messages that the original
- * sender explicitly marks as vault-able.
+ * Per-user, biometric-gated archive for messages the original sender
+ * explicitly allowed to be persisted (`vaultAllowed = true`).
  *
- * Security model
- * ──────────────
- * • Each vault entry is re-encrypted with a vault key derived from the
- *   user's WebAuthn credential ID via HKDF.  The server-side
- *   VAULT_ENCRYPTION_SECRET is required in addition to the credential ID,
- *   so neither the database dump alone nor the credential ID alone suffices.
- * • Vault unlock is gated on a WebAuthn assertion in the route layer.
- *   This service assumes the caller has already verified the assertion.
- * • Hard cap: 100 entries per user.  When the cap is reached, the oldest
- *   entry is removed automatically (LRU eviction) before the new one is
- *   written.
- *
- * Vault key derivation
- * ────────────────────
- * vaultKey = HKDF-SHA256(
- *   ikm   = VAULT_ENCRYPTION_SECRET,
- *   salt  = credentialId,
- *   info  = "quantmail-vault-v1:<userId>",
- *   len   = 32 bytes
- * )
- * The derived key is then used for AES-256-GCM encryption of the content.
+ * Storage model
+ * ─────────────
+ *   – Vaulted ciphertext + IV + auth tag are copied verbatim from the
+ *     EphemeralMessage row.  The server still cannot decrypt them.
+ *   – The AES-256-GCM message key (which the recipient learned via the
+ *     URL fragment) is *wrapped* under a per-user vault key derived from
+ *     `ENCRYPTION_SECRET` + `userId` via HKDF.  This means the unwrapped
+ *     message keys never touch disk.
+ *   – Unlock requires a fresh WebAuthn assertion: callers obtain a
+ *     biometric challenge from `WebAuthnService.generateAuthChallenge`,
+ *     prompt the user, and pass the verified `userId` plus the
+ *     `unlockToken` returned by `mintUnlockToken` to `unlock`.
+ *   – Capacity: 100 entries / user.  When the limit would be exceeded,
+ *     `put` evicts the oldest entry first ("FIFO eviction").
  */
 
 import {
@@ -32,256 +25,318 @@ import {
   createDecipheriv,
   createHmac,
   randomBytes,
+  timingSafeEqual,
 } from "node:crypto";
 import { prisma } from "../db";
+import { hkdf } from "./KeyExchangeService";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const MAX_VAULT_ENTRIES = 100;
-const VAULT_HKDF_INFO_PREFIX = "quantmail-vault-v1";
-
-// ─── Types ────────────────────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────
 
 export interface VaultEntry {
   id: string;
-  userId: string;
-  ephemeralMessageId: string | null;
-  senderEmail: string;
+  originalId: string | null;
   subject: string;
-  /** Base64url-encoded AES-256-GCM ciphertext of the original message body. */
-  encryptedContent: string;
-  vaultedAt: Date;
-  webAuthnCredId: string;
+  savedAt: Date;
+  lastAccessedAt: Date | null;
+  accessCount: number;
 }
 
-export interface VaultEntryMeta {
-  id: string;
+export interface VaultEntryWithCipher extends VaultEntry {
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  algorithm: "AES-256-GCM";
+  /** Wrapped (encrypted) message key – decrypt with `unwrapKey`. */
+  wrappedKey: { data: string; iv: string; authTag: string };
+}
+
+export interface UnlockToken {
   userId: string;
-  ephemeralMessageId: string | null;
-  senderEmail: string;
-  subject: string;
-  vaultedAt: Date;
+  issuedAt: number;
+  expiresAt: number;
+  signature: string;
 }
 
-export interface AddToVaultInput {
-  userId: string;
-  webAuthnCredId: string;
-  senderEmail: string;
-  subject: string;
-  /** Plain-text message body to be vault-encrypted. */
-  plainContent: string;
-  ephemeralMessageId?: string;
+// ─── Constants ────────────────────────────────────────────────────
+
+export const VAULT_CAPACITY = 100;
+const UNLOCK_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const UNLOCK_TOKEN_VERSION = "v1";
+
+const HKDF_SALT = Buffer.from("quantmail/message-vault/v1", "utf8");
+const HKDF_INFO_PREFIX = "quantmail/vault-key/";
+
+function getServerSecret(): string {
+  return process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
 }
 
-export interface DecryptVaultEntryInput {
-  entryId: string;
-  userId: string;
-  webAuthnCredId: string;
+function getUnlockSecret(): string {
+  return process.env["VAULT_UNLOCK_SECRET"] || getServerSecret();
 }
 
-// ─── Vault key derivation ─────────────────────────────────────────────────────
+// ─── Per-user vault key ──────────────────────────────────────────
 
 /**
- * Derives a 256-bit AES vault key using HKDF-SHA256.
+ * Derives the user's 32-byte vault wrapping key.  The key is bound to
+ * the user id and the server secret, so:
  *
- * ikm   = VAULT_ENCRYPTION_SECRET (server secret)
- * salt  = credentialId (ties the key to a specific WebAuthn device)
- * info  = "quantmail-vault-v1:<userId>"
+ *   • Every user has an independent vault key (no cross-tenant leakage).
+ *   • Re-deploying with a new ENCRYPTION_SECRET makes all wrapped keys
+ *     unrecoverable — equivalent to a hard reset of every vault.
  */
-export function deriveVaultKey(userId: string, credentialId: string): Buffer {
-  const secret =
-    process.env["VAULT_ENCRYPTION_SECRET"] ||
-    process.env["ENCRYPTION_SECRET"] ||
-    "quantmail-vault-fallback-secret";
-
-  const info = `${VAULT_HKDF_INFO_PREFIX}:${userId}`;
-
-  // HKDF extract
-  const prk = createHmac("sha256", credentialId).update(secret).digest();
-
-  // HKDF expand (one block = 32 bytes)
-  const infoBuffer = Buffer.from(info, "utf-8");
-  const counter = Buffer.from([0x01]);
-  return createHmac("sha256", prk)
-    .update(infoBuffer)
-    .update(counter)
-    .digest()
-    .slice(0, 32);
+export function deriveVaultKey(userId: string): Buffer {
+  return hkdf(
+    Buffer.from(getServerSecret(), "utf8"),
+    HKDF_SALT,
+    Buffer.from(HKDF_INFO_PREFIX + userId, "utf8"),
+    32
+  );
 }
 
-// ─── Encrypt / decrypt helpers ────────────────────────────────────────────────
-
-/**
- * Encrypts plaintext content using AES-256-GCM with the derived vault key.
- * Returns a combined buffer: iv (12 bytes) || authTag (16 bytes) || ciphertext.
- */
-export function encryptVaultContent(
-  plainContent: string,
-  vaultKey: Buffer
-): Buffer {
+/** Wraps a plaintext AES key under the user's vault key. */
+export function wrapKey(
+  plainKeyB64: string,
+  userId: string
+): { data: string; iv: string; authTag: string } {
+  const plain = Buffer.from(plainKeyB64, "base64url");
+  if (plain.length !== 32) {
+    throw new Error("Wrapped key must be 32 bytes (AES-256)");
+  }
+  const wrappingKey = deriveVaultKey(userId);
   const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", vaultKey, iv);
-  const encrypted = Buffer.concat([
-    cipher.update(plainContent, "utf-8"),
-    cipher.final(),
-  ]);
-  const authTag = cipher.getAuthTag();
-
-  return Buffer.concat([iv, authTag, encrypted]);
-}
-
-/**
- * Decrypts vault content encrypted by encryptVaultContent.
- * Throws if authentication fails.
- */
-export function decryptVaultContent(
-  encryptedBuffer: Buffer,
-  vaultKey: Buffer
-): string {
-  if (encryptedBuffer.length < 28) {
-    throw new Error("Vault entry is too short to be valid.");
-  }
-
-  const iv = encryptedBuffer.slice(0, 12);
-  const authTag = encryptedBuffer.slice(12, 28);
-  const ciphertext = encryptedBuffer.slice(28);
-
-  const decipher = createDecipheriv("aes-256-gcm", vaultKey, iv);
-  decipher.setAuthTag(authTag);
-
-  return Buffer.concat([
-    decipher.update(ciphertext),
-    decipher.final(),
-  ]).toString("utf-8");
-}
-
-// ─── Service functions ────────────────────────────────────────────────────────
-
-/**
- * Adds a message to the user's vault.
- *
- * If the vault already contains MAX_VAULT_ENTRIES (100) items, the oldest
- * entry is removed before the new one is written (LRU eviction).
- *
- * Precondition: the caller MUST have already verified the WebAuthn assertion.
- */
-export async function addToVault(input: AddToVaultInput): Promise<VaultEntryMeta> {
-  const { userId, webAuthnCredId, senderEmail, subject, plainContent, ephemeralMessageId } =
-    input;
-
-  // Count current vault entries.
-  const count = await prisma.messageVaultEntry.count({ where: { userId } });
-
-  if (count >= MAX_VAULT_ENTRIES) {
-    // Evict the oldest entry.
-    const oldest = await prisma.messageVaultEntry.findFirst({
-      where: { userId },
-      orderBy: { vaultedAt: "asc" },
-      select: { id: true },
-    });
-    if (oldest) {
-      await prisma.messageVaultEntry.delete({ where: { id: oldest.id } });
-    }
-  }
-
-  const vaultKey = deriveVaultKey(userId, webAuthnCredId);
-  const encryptedBuffer = encryptVaultContent(plainContent, vaultKey);
-
-  const entry = await prisma.messageVaultEntry.create({
-    data: {
-      userId,
-      webAuthnCredId,
-      senderEmail,
-      subject,
-      encryptedContent: new Uint8Array(encryptedBuffer),
-      ephemeralMessageId: ephemeralMessageId ?? null,
-    },
-  });
-
+  const cipher = createCipheriv("aes-256-gcm", wrappingKey, iv);
+  const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
   return {
-    id: entry.id,
-    userId: entry.userId,
-    ephemeralMessageId: entry.ephemeralMessageId,
-    senderEmail: entry.senderEmail,
-    subject: entry.subject,
-    vaultedAt: entry.vaultedAt,
+    data: ct.toString("base64url"),
+    iv: iv.toString("base64url"),
+    authTag: tag.toString("base64url"),
   };
 }
 
+/** Reverses `wrapKey`.  Returns null on tamper. */
+export function unwrapKey(
+  wrapped: { data: string; iv: string; authTag: string },
+  userId: string
+): string | null {
+  try {
+    const wrappingKey = deriveVaultKey(userId);
+    const iv = Buffer.from(wrapped.iv, "base64url");
+    const tag = Buffer.from(wrapped.authTag, "base64url");
+    const data = Buffer.from(wrapped.data, "base64url");
+    const decipher = createDecipheriv("aes-256-gcm", wrappingKey, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(data), decipher.final()]).toString(
+      "base64url"
+    );
+  } catch {
+    return null;
+  }
+}
+
+// ─── Biometric unlock tokens ─────────────────────────────────────
+
 /**
- * Returns vault entry metadata for a user (without decrypting content).
- * Requires WebAuthn assertion to be verified by the route layer.
+ * Issues an HMAC-signed unlock token after WebAuthn verification has
+ * succeeded.  The route handler is responsible for actually performing
+ * the WebAuthn assertion check; this helper simply binds the result
+ * to a short-lived token that the SecureReader / Vault UI presents on
+ * subsequent reads.
  */
-export async function listVaultEntries(userId: string): Promise<VaultEntryMeta[]> {
-  const entries = await prisma.messageVaultEntry.findMany({
-    where: { userId },
-    orderBy: { vaultedAt: "desc" },
-    select: {
-      id: true,
-      userId: true,
-      ephemeralMessageId: true,
-      senderEmail: true,
-      subject: true,
-      vaultedAt: true,
+export function mintUnlockToken(userId: string, now: Date = new Date()): string {
+  const issuedAt = now.getTime();
+  const expiresAt = issuedAt + UNLOCK_TOKEN_TTL_MS;
+  const payload = `${UNLOCK_TOKEN_VERSION}.${userId}.${issuedAt}.${expiresAt}`;
+  const sig = createHmac("sha256", getUnlockSecret())
+    .update(payload)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+/** Parses + validates an unlock token; returns the userId or null. */
+export function verifyUnlockToken(
+  token: string,
+  now: Date = new Date()
+): string | null {
+  const parts = token.split(".");
+  if (parts.length !== 5) return null;
+  const [version, userId, issuedAtStr, expiresAtStr, providedSig] = parts;
+  if (version !== UNLOCK_TOKEN_VERSION) return null;
+  const expiresAt = Number(expiresAtStr);
+  if (!Number.isFinite(expiresAt) || expiresAt < now.getTime()) return null;
+
+  const expectedSig = createHmac("sha256", getUnlockSecret())
+    .update(`${version}.${userId}.${issuedAtStr}.${expiresAtStr}`)
+    .digest("base64url");
+  const a = Buffer.from(providedSig);
+  const b = Buffer.from(expectedSig);
+  if (a.length !== b.length) return null;
+  if (!timingSafeEqual(a, b)) return null;
+  return userId;
+}
+
+// ─── CRUD operations ─────────────────────────────────────────────
+
+/**
+ * Inserts a vaulted message, evicting the oldest entry if the user is
+ * already at `VAULT_CAPACITY`.
+ *
+ * The plaintext message key (`messageKeyB64`) is wrapped before storage;
+ * the caller is expected to have just decrypted the original ephemeral
+ * message and to already hold the symmetric key in memory.
+ */
+export async function put(params: {
+  ownerUserId: string;
+  originalId: string | null;
+  subject: string;
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  messageKeyB64: string;
+}): Promise<VaultEntry> {
+  const wrapped = wrapKey(params.messageKeyB64, params.ownerUserId);
+
+  const existing = await prisma.vaultedMessage.count({
+    where: { ownerUserId: params.ownerUserId },
+  });
+  if (existing >= VAULT_CAPACITY) {
+    const overflow = existing - VAULT_CAPACITY + 1;
+    const toEvict = await prisma.vaultedMessage.findMany({
+      where: { ownerUserId: params.ownerUserId },
+      orderBy: { savedAt: "asc" },
+      take: overflow,
+      select: { id: true },
+    });
+    if (toEvict.length > 0) {
+      await prisma.vaultedMessage.deleteMany({
+        where: { id: { in: toEvict.map((r) => r.id) } },
+      });
+    }
+  }
+
+  const created = await prisma.vaultedMessage.create({
+    data: {
+      ownerUserId: params.ownerUserId,
+      originalId: params.originalId,
+      subject: params.subject,
+      ciphertext: params.ciphertext,
+      iv: params.iv,
+      authTag: params.authTag,
+      algorithm: "AES-256-GCM",
+      wrappedKey: wrapped.data,
+      wrappedKeyIv: wrapped.iv,
+      wrappedKeyTag: wrapped.authTag,
     },
   });
+  return {
+    id: created.id,
+    originalId: created.originalId,
+    subject: created.subject,
+    savedAt: created.savedAt,
+    lastAccessedAt: created.lastAccessedAt,
+    accessCount: created.accessCount,
+  };
+}
 
-  return entries.map((e) => ({
-    id: e.id,
-    userId: e.userId,
-    ephemeralMessageId: e.ephemeralMessageId,
-    senderEmail: e.senderEmail,
-    subject: e.subject,
-    vaultedAt: e.vaultedAt,
+export async function list(ownerUserId: string): Promise<VaultEntry[]> {
+  const rows = await prisma.vaultedMessage.findMany({
+    where: { ownerUserId },
+    orderBy: { savedAt: "desc" },
+  });
+  return rows.map((row) => ({
+    id: row.id,
+    originalId: row.originalId,
+    subject: row.subject,
+    savedAt: row.savedAt,
+    lastAccessedAt: row.lastAccessedAt,
+    accessCount: row.accessCount,
   }));
 }
 
 /**
- * Decrypts and returns the plaintext content of a vault entry.
- *
- * Precondition: the caller MUST have already verified the WebAuthn assertion
- * for `webAuthnCredId`.
- *
- * Returns null if the entry is not found or does not belong to the user.
- * Throws if decryption fails (wrong key / tampered data).
+ * Returns a vaulted message including its (still-wrapped) key, but ONLY
+ * if the supplied unlock token is valid for the owning user.
  */
-export async function decryptVaultEntry(
-  input: DecryptVaultEntryInput
-): Promise<string | null> {
-  const { entryId, userId, webAuthnCredId } = input;
-
-  const entry = await prisma.messageVaultEntry.findFirst({
-    where: { id: entryId, userId },
-  });
-
-  if (!entry) return null;
-
-  const vaultKey = deriveVaultKey(userId, webAuthnCredId);
-  return decryptVaultContent(Buffer.from(entry.encryptedContent), vaultKey);
-}
-
-/**
- * Removes a specific vault entry.
- * Returns true if deleted, false if not found / not owned by the user.
- */
-export async function removeVaultEntry(
+export async function unlock(
   entryId: string,
-  userId: string
-): Promise<boolean> {
-  const existing = await prisma.messageVaultEntry.findFirst({
-    where: { id: entryId, userId },
-    select: { id: true },
+  unlockToken: string
+): Promise<VaultEntryWithCipher | null> {
+  const userId = verifyUnlockToken(unlockToken);
+  if (!userId) return null;
+  const row = await prisma.vaultedMessage.findUnique({
+    where: { id: entryId },
+  });
+  if (!row || row.ownerUserId !== userId) return null;
+
+  await prisma.vaultedMessage.update({
+    where: { id: entryId },
+    data: {
+      lastAccessedAt: new Date(),
+      accessCount: row.accessCount + 1,
+    },
   });
 
-  if (!existing) return false;
-
-  await prisma.messageVaultEntry.delete({ where: { id: entryId } });
-  return true;
+  return {
+    id: row.id,
+    originalId: row.originalId,
+    subject: row.subject,
+    savedAt: row.savedAt,
+    lastAccessedAt: new Date(),
+    accessCount: row.accessCount + 1,
+    ciphertext: row.ciphertext,
+    iv: row.iv,
+    authTag: row.authTag,
+    algorithm: "AES-256-GCM",
+    wrappedKey: {
+      data: row.wrappedKey,
+      iv: row.wrappedKeyIv,
+      authTag: row.wrappedKeyTag,
+    },
+  };
 }
 
 /**
- * Returns the number of vault entries for a user.
+ * Convenience that combines `unlock` with `unwrapKey` so callers get
+ * back the plaintext AES key (still without the server ever holding
+ * the *plaintext message body*).
  */
-export async function getVaultSize(userId: string): Promise<number> {
-  return prisma.messageVaultEntry.count({ where: { userId } });
+export async function unlockAndUnwrap(
+  entryId: string,
+  unlockToken: string
+): Promise<{ entry: VaultEntryWithCipher; messageKey: string } | null> {
+  const entry = await unlock(entryId, unlockToken);
+  if (!entry) return null;
+  const verifiedUser = verifyUnlockToken(unlockToken);
+  if (!verifiedUser) return null;
+  const key = unwrapKey(entry.wrappedKey, verifiedUser);
+  if (!key) return null;
+  return { entry, messageKey: key };
+}
+
+/** Removes a vault entry; returns true if a row was deleted. */
+export async function remove(
+  entryId: string,
+  ownerUserId: string
+): Promise<boolean> {
+  const result = await prisma.vaultedMessage.deleteMany({
+    where: { id: entryId, ownerUserId },
+  });
+  return result.count > 0;
+}
+
+/** Empties the user's vault.  Returns the number of rows removed. */
+export async function clear(ownerUserId: string): Promise<number> {
+  const result = await prisma.vaultedMessage.deleteMany({
+    where: { ownerUserId },
+  });
+  return result.count;
+}
+
+export async function capacity(ownerUserId: string): Promise<{
+  used: number;
+  total: number;
+  remaining: number;
+}> {
+  const used = await prisma.vaultedMessage.count({ where: { ownerUserId } });
+  return { used, total: VAULT_CAPACITY, remaining: VAULT_CAPACITY - used };
 }

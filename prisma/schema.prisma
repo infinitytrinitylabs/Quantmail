@@ -67,11 +67,19 @@ model User {
   sheets                    Sheet[]
   driveFiles                DriveFile[]
   aiSettings                UserAiSettings?
+
+  // Cross-app streak system
+  shareStreak               Boolean              @default(false)
+  autoConsumeShield         Boolean              @default(false)
+  dailyActivities           DailyActivity[]
+  streak                    UserStreak?
+  streakShields             StreakShield[]
   biometricHashes           BiometricHash[]
   webAuthnChallenges        WebAuthnChallenge[]
   webAuthnCredentials       WebAuthnCredential[]
-  sentEphemeralMessages     EphemeralMessage[]   @relation("SentEphemeralMessages")
-  messageVaultEntries       MessageVaultEntry[]
+  ephemeralMessagesSent     EphemeralMessage[]   @relation("EphemeralMessagesSent")
+  keyExchangePairs          KeyExchangePair[]    @relation("KeyExchangePairs")
+  vaultedMessages           VaultedMessage[]     @relation("VaultedMessages")
 }
 
 // ─── AI / BYOK Settings ──────────────────────────────────────────
@@ -173,6 +181,144 @@ model ShadowInbox {
   domain         String
   reason         String   @default("UNVERIFIED_DOMAIN")
   droppedAt      DateTime @default(now())
+}
+
+// ─── Self-Destructing Encrypted Messages (Issue #45) ─────────────
+
+enum EphemeralDestructionMode {
+  READ_ONCE
+  TIMER_1H
+  TIMER_24H
+  TIMER_7D
+  SCREENSHOT_PROOF
+}
+
+enum EphemeralMessageState {
+  ACTIVE
+  READ
+  EXPIRED
+  DESTROYED
+  REVOKED
+}
+
+enum KeyExchangeAlgorithm {
+  ECDH_P256
+  ECDH_P384
+}
+
+enum KeyExchangePairState {
+  ACTIVE
+  ROTATED
+  REVOKED
+}
+
+/// Encrypted, self-destructing message.
+///
+/// The server only ever stores opaque ciphertext + AEAD metadata.  The
+/// symmetric AES-256-GCM key is generated client-side and embedded in the
+/// recipient's URL fragment, so the server cannot decrypt the body.  When the
+/// destruction condition is met (single read, timer expiry, or explicit
+/// revocation) the ciphertext column is overwritten with random bytes and the
+/// row is hard-deleted by `EphemeralMailService.purgeDestroyed`.
+model EphemeralMessage {
+  id                  String                   @id @default(uuid())
+  senderUserId        String
+  recipientEmail      String
+  subject             String
+  ciphertext          String
+  iv                  String
+  authTag             String
+  algorithm           String                   @default("AES-256-GCM")
+  destructionMode     EphemeralDestructionMode
+  state               EphemeralMessageState    @default(ACTIVE)
+  expiresAt           DateTime?
+  maxReads            Int                      @default(1)
+  readCount           Int                      @default(0)
+  senderEphemeralKey  String?
+  keyExchangePairId   String?
+  vaultAllowed        Boolean                  @default(false)
+  attachmentsBlob     String?
+  attachmentsIv       String?
+  attachmentsAuthTag  String?
+  createdAt           DateTime                 @default(now())
+  destroyedAt         DateTime?
+  destructionReason   String?
+
+  sender       User                        @relation("EphemeralMessagesSent", fields: [senderUserId], references: [id], onDelete: Cascade)
+  keyExchange  KeyExchangePair?            @relation(fields: [keyExchangePairId], references: [id])
+  deliveries   EphemeralMessageDelivery[]
+
+  @@index([senderUserId, createdAt])
+  @@index([recipientEmail, state])
+  @@index([state, expiresAt])
+}
+
+/// Audit / access record for each open attempt of an EphemeralMessage.
+/// Used to enforce READ_ONCE semantics atomically and to surface a
+/// tamper-evident access log to the sender.
+model EphemeralMessageDelivery {
+  id           String   @id @default(uuid())
+  messageId    String
+  ipHash       String
+  userAgent    String   @default("")
+  succeeded    Boolean
+  reason       String   @default("")
+  accessedAt   DateTime @default(now())
+
+  message EphemeralMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId, accessedAt])
+}
+
+/// Persistent record of an ECDH key pair used for forward-secret messaging.
+///
+/// A new pair is created per-message (forward secrecy): leaking any single
+/// pair's private key never compromises previously sent messages because each
+/// message uses an independent shared secret derived via HKDF.  Revoking a
+/// pair marks every message that used it as unreadable.
+model KeyExchangePair {
+  id            String                @id @default(uuid())
+  ownerUserId   String
+  algorithm     KeyExchangeAlgorithm  @default(ECDH_P256)
+  publicKey     String
+  privateKey    String
+  fingerprint   String                @unique
+  state         KeyExchangePairState  @default(ACTIVE)
+  label         String                @default("")
+  createdAt     DateTime              @default(now())
+  rotatedAt     DateTime?
+  revokedAt     DateTime?
+  expiresAt     DateTime?
+
+  owner    User               @relation("KeyExchangePairs", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  messages EphemeralMessage[]
+
+  @@index([ownerUserId, state])
+  @@index([state, createdAt])
+}
+
+/// A message the sender has explicitly allowed the recipient to retain in
+/// their biometric Vault.  The vault is bounded to 100 entries per user –
+/// `MessageVault.put` evicts the oldest row when that limit would be exceeded.
+model VaultedMessage {
+  id              String   @id @default(uuid())
+  ownerUserId     String
+  originalId      String?
+  subject         String
+  ciphertext      String
+  iv              String
+  authTag         String
+  algorithm       String   @default("AES-256-GCM")
+  wrappedKey      String
+  wrappedKeyIv    String
+  wrappedKeyTag   String
+  savedAt         DateTime @default(now())
+  lastAccessedAt  DateTime?
+  accessCount     Int      @default(0)
+
+  owner User @relation("VaultedMessages", fields: [ownerUserId], references: [id], onDelete: Cascade)
+
+  @@index([ownerUserId, savedAt])
 }
 
 // ─── Saccade Liveness (Quantedits Integration) ───────────────────
@@ -580,6 +726,86 @@ model AdminConfig {
   updatedAt          DateTime @updatedAt
 }
 
+// ─── Cross-App Streak System ──────────────────────────────────────
+//
+// Positive-engagement streaks across the 9 apps.  Deliberately contains
+// no ELO decay, no badge revocation, and no "ghost mode" fields.  Losing
+// a streak has no status penalty — the counter simply resets.
+
+enum AppId {
+  MAIL
+  CALENDAR
+  DRIVE
+  DOCS
+  SHEETS
+  NOTES
+  TASKS
+  CHAT
+  MEET
+}
+
+enum StreakShieldSource {
+  PURCHASE
+  PROMO
+  COMEBACK_GIFT
+  MILESTONE // free shield granted every N streak days
+}
+
+/// One record per user per app per UTC calendar day.  Writes are
+/// idempotent: recording twice for the same (userId, appId, date) is a
+/// no-op (enforced by the composite unique index).
+model DailyActivity {
+  id        String   @id @default(uuid())
+  userId    String
+  appId     AppId
+  date      DateTime @db.Date
+  count     Int      @default(1)
+  firstAt   DateTime @default(now())
+  lastAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, appId, date], name: "daily_activity_unique")
+  @@index([userId, date])
+}
+
+/// Aggregate per-user streak state.  Rolled forward by
+/// `StreakMaintenanceWorker` and updated transactionally on each
+/// activity event.
+model UserStreak {
+  id                  String    @id @default(uuid())
+  userId              String    @unique
+  currentStreak       Int       @default(0)
+  longestStreak       Int       @default(0)
+  lastActiveDate      DateTime? @db.Date
+  trinityDays         Int       @default(0) // lifetime count of all-9-apps days
+  lastTrinityDate     DateTime? @db.Date
+  shieldCount         Int       @default(0) // active shields (cap 2)
+  shieldsGrantedTotal Int       @default(0)
+  lastMilestoneGrant  Int       @default(0) // last currentStreak at which a milestone shield was granted
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+}
+
+/// Ledger entry for each shield granted to a user.  A shield is
+/// considered "active" while `usedAt` is null.  Holding more than 2
+/// active shields is prevented at the service layer.
+model StreakShield {
+  id          String             @id @default(uuid())
+  userId      String
+  source      StreakShieldSource
+  grantedAt   DateTime           @default(now())
+  usedAt      DateTime?
+  usedForDate DateTime?          @db.Date
+  note        String             @default("")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, usedAt])
+}
+
 // ─── Behavioral Biometrics ────────────────────────────────────────
 
 /**
@@ -595,98 +821,4 @@ model SecurityAuditLog {
 
   @@index([userId, occurredAt])
   @@index([eventType, occurredAt])
-}
-
-// ─── Ephemeral E2E Messages ───────────────────────────────────────
-
-/**
- * Destruction modes for self-destructing messages.
- *
- * READ_ONCE        — message is destroyed after the first successful read.
- * TIMER_1H         — message expires 1 hour after creation.
- * TIMER_24H        — message expires 24 hours after creation.
- * TIMER_7D         — message expires 7 days after creation.
- * SCREENSHOT_PROOF — same as READ_ONCE but also applies CSS/JS anti-capture
- *                    overlays in the SecureReader component.
- */
-enum DestructionMode {
-  READ_ONCE
-  TIMER_1H
-  TIMER_24H
-  TIMER_7D
-  SCREENSHOT_PROOF
-}
-
-/**
- * Server-side store for AES-256-GCM encrypted message blobs.
- *
- * The actual decryption key is NEVER stored here.  It lives exclusively
- * in the URL fragment (#key=…) so the server cannot read the content.
- * After destruction, the blob is overwritten with random bytes before
- * the row is deleted.
- */
-model EphemeralMessage {
-  id              String          @id @default(uuid())
-  senderId        String
-  recipientEmail  String
-  encryptedBlob   Bytes
-  iv              String
-  authTag         String
-  subject         String          @default("")
-  destructionMode DestructionMode @default(READ_ONCE)
-  screenshotProof Boolean         @default(false)
-  expiresAt       DateTime?
-  readAt          DateTime?
-  destroyedAt     DateTime?
-  createdAt       DateTime        @default(now())
-
-  sender  User              @relation("SentEphemeralMessages", fields: [senderId], references: [id])
-  keyPair EphemeralKeyPair?
-
-  @@index([recipientEmail])
-  @@index([senderId])
-  @@index([expiresAt])
-}
-
-/**
- * Per-message ECDH key pair record.
- *
- * The server stores only the sender's ephemeral public key so the
- * recipient can derive the shared secret client-side.  The private key
- * is generated client-side and never transmitted.
- *
- * Revoking a key pair makes all messages encrypted with it unreadable
- * (the client can no longer perform the ECDH derivation).
- */
-model EphemeralKeyPair {
-  id               String    @id @default(uuid())
-  messageId        String    @unique
-  senderPublicKey  String
-  recipientPubKey  String?
-  revokedAt        DateTime?
-  createdAt        DateTime  @default(now())
-
-  message EphemeralMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
-}
-
-/**
- * Message Vault — optional long-term storage for ephemeral messages
- * that the original sender explicitly allows to be saved.
- *
- * Protected by WebAuthn biometric unlock.  Hard capped at 100 entries
- * per user; the oldest entry is auto-removed when the cap is reached.
- */
-model MessageVaultEntry {
-  id                 String   @id @default(uuid())
-  userId             String
-  ephemeralMessageId String?
-  encryptedContent   Bytes
-  senderEmail        String
-  subject            String
-  webAuthnCredId     String
-  vaultedAt          DateTime @default(now())
-
-  user User @relation(fields: [userId], references: [id])
-
-  @@index([userId, vaultedAt])
 }

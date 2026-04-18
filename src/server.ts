@@ -28,6 +28,8 @@ import { adminRoutes } from "./routes/admin";
 import { webhookRoutes } from "./routes/webhook";
 import { superAppRoutes } from "./routes/superapp";
 import { smartReplyRoutes } from "./routes/smartReply";
+import { streakRoutes } from "./routes/streak";
+import { smartComposeRoutes } from "./routes/smartCompose";
 import { ephemeralRoutes } from "./routes/ephemeral";
 import { tokenValidatorRoutes } from "./services/TokenValidator";
 import { prisma } from "./db";
@@ -127,6 +129,8 @@ async function main(): Promise<void> {
   await app.register(webhookRoutes);
   await app.register(superAppRoutes);
   await app.register(smartReplyRoutes);
+  await app.register(streakRoutes);
+  await app.register(smartComposeRoutes);
   await app.register(ephemeralRoutes);
   await app.register(tokenValidatorRoutes);
   await app.register(profileRoutes);

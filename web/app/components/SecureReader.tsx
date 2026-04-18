@@ -1,43 +1,45 @@
 "use client";
 
 /**
- * SecureReader Component
+ * SecureReader
  *
- * Displays a self-destructing, end-to-end encrypted message in a security-
- * hardened environment.
+ * Client-side viewer for Self-Destructing Encrypted Messages (issue #45).
  *
- * Features
- * ────────
- * • Decrypts the message entirely in the browser using the Web Crypto API.
- *   The AES-256-GCM key lives only in the URL fragment — it is never sent
- *   to the server.
- * • SCREENSHOT_PROOF mode: CSS user-select:none + JS-level event prevention
- *   for right-click, print, and clipboard access.  A semi-transparent
- *   watermark overlay shows the recipient's email on every "frame".
- * • Self-destruct countdown timer displayed in the corner.
- *   "This message will self-destruct in…" animation for READ_ONCE /
- *   SCREENSHOT_PROOF modes.
- * • "Shredding" animation plays when the message is destroyed.
- * • Renders decrypted HTML content inside a sandboxed <iframe> so any
- *   injected scripts cannot escape to the parent page.
+ * Responsibilities
+ * ────────────────
+ *   1. Extract the AES-256-GCM message key from `window.location.hash`
+ *      (the `#k=<base64url>` fragment that the server never saw).
+ *   2. GET `/ephemeral/:id` to retrieve the ciphertext + IV + auth tag.
+ *      The server transitions the message to READ/DESTROYED as a side
+ *      effect of that request, so this component is the destruction
+ *      trigger.
+ *   3. Decrypt the payload locally via WebCrypto (AES-GCM).
+ *   4. Render the plaintext inside a sandboxed iframe (`sandbox` attr
+ *      with no `allow-same-origin` / `allow-scripts`) so any HTML in
+ *      the message cannot exfiltrate the key or call APIs.
+ *   5. Apply the destruction-mode UX:
+ *        • READ_ONCE        – one visible countdown, then shred.
+ *        • TIMER_*          – countdown to `expiresAt`.
+ *        • SCREENSHOT_PROOF – user-select:none, overlay watermark,
+ *                             blocked right-click / copy / print.
+ *   6. When the countdown reaches 0 or the user dismisses the reader,
+ *      trigger the "shredding" animation and wipe the decrypted copy
+ *      from React state and the clipboard.
  *
- * Props
- * ─────
- *   messageId        string   — ID of the ephemeral message to fetch.
- *   recipientEmail   string   — used for the watermark overlay.
- *   apiBase          string   — base URL of the Quantmail backend (optional).
+ *  This component is self-contained – it has no external dependencies
+ *  beyond React + the browser's WebCrypto + fetch implementations.
  */
 
 import {
-  useState,
-  useEffect,
   useCallback,
+  useEffect,
+  useMemo,
   useRef,
-  type FC,
+  useState,
+  type CSSProperties,
 } from "react";
-import { motion, AnimatePresence } from "framer-motion";
 
-// ─── Types ─────────────────────────────────────────────────────────────────────
+// ─── Types mirroring the server response ──────────────────────────
 
 type DestructionMode =
   | "READ_ONCE"
@@ -46,50 +48,73 @@ type DestructionMode =
   | "TIMER_7D"
   | "SCREENSHOT_PROOF";
 
-interface SecureMessagePayload {
-  id: string;
-  encryptedBlob: string | null;
-  iv: string | null;
-  authTag: string | null;
-  subject: string;
-  destructionMode: DestructionMode;
-  screenshotProof: boolean;
-  senderPublicKey: string | null;
-  alreadyDestroyed: boolean;
-  destroyedAt: string | null;
+interface EncryptedPayload {
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  algorithm: "AES-256-GCM";
 }
 
-type ComponentState =
-  | { phase: "idle" }
-  | { phase: "loading" }
-  | { phase: "awaiting_key" }
-  | { phase: "decrypting" }
-  | { phase: "ready"; plainHtml: string; subject: string; mode: DestructionMode; screenshotProof: boolean; expiresIn: number | null }
-  | { phase: "destroyed"; at: Date }
-  | { phase: "error"; message: string };
+interface FetchSuccess {
+  ok: true;
+  id: string;
+  subject: string;
+  payload: EncryptedPayload;
+  attachments: EncryptedPayload | null;
+  destructionMode: DestructionMode;
+  expiresAt: string | null;
+  senderEphemeralPublicKey: string;
+  vaultAllowed: boolean;
+  remainingReads: number;
+  screenshotProof: boolean;
+}
+
+interface FetchFailure {
+  error: "NOT_FOUND" | "EXPIRED" | "ALREADY_READ" | "DESTROYED" | "REVOKED";
+}
 
 export interface SecureReaderProps {
+  /** The ephemeral message id (from the path, not the fragment). */
   messageId: string;
-  recipientEmail?: string;
+  /**
+   * Override the automatic fragment reader – used in tests.  When
+   * provided, the component skips reading `window.location.hash`.
+   */
+  keyOverride?: string;
+  /** Base URL for the API; defaults to empty (same origin). */
   apiBase?: string;
+  /** Optional callback fired after the shredding animation finishes. */
+  onDestroyed?: () => void;
+  /**
+   * Invoked when the user clicks "Save to Vault" – only rendered when
+   * the sender set `vaultAllowed = true`.  The caller is responsible
+   * for running the WebAuthn flow and POSTing to `/vault`.
+   */
+  onSaveToVault?: (params: {
+    messageId: string;
+    messageKey: string;
+    payload: EncryptedPayload;
+    subject: string;
+  }) => Promise<void> | void;
 }
 
-// ─── Constants ─────────────────────────────────────────────────────────────────
+type Phase =
+  | "LOADING"
+  | "READY"
+  | "ERROR"
+  | "SHREDDING"
+  | "DESTROYED";
 
-const DEFAULT_API_BASE =
-  typeof window !== "undefined"
-    ? window.location.origin.replace(":3000", ":3001")
-    : "http://localhost:3001";
+// ─── base64url helpers (the fragment uses base64url) ──────────────
 
-// ─── Web Crypto helpers ────────────────────────────────────────────────────────
-
-/**
- * Decodes a base64url string to a Uint8Array.
- */
-function base64urlToUint8Array(base64url: string): Uint8Array {
-  const base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
-  const binary = atob(padded);
+function base64UrlToBytes(input: string): Uint8Array {
+  const padded =
+    input.replace(/-/g, "+").replace(/_/g, "/") +
+    "===".slice((input.length + 3) % 4);
+  const binary =
+    typeof atob === "function"
+      ? atob(padded)
+      : Buffer.from(padded, "base64").toString("binary");
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -97,606 +122,490 @@ function base64urlToUint8Array(base64url: string): Uint8Array {
   return bytes;
 }
 
-/**
- * Parses the URL fragment to extract the AES key material.
- * Expected fragment format: #key=<base64url-raw-key>
- *   or (ECDH mode): #pub=<senderPubKey>&s=<salt>
- */
-function parseKeyFragment(): { rawKey?: string; senderPubKey?: string; salt?: string } {
-  if (typeof window === "undefined") return {};
-  const hash = window.location.hash.slice(1);
-  const params = new URLSearchParams(hash);
-  return {
-    rawKey: params.get("key") ?? undefined,
-    senderPubKey: params.get("pub") ?? undefined,
-    salt: params.get("s") ?? undefined,
-  };
+function extractKeyFromHash(hash: string): string | null {
+  const trimmed = hash.startsWith("#") ? hash.slice(1) : hash;
+  if (!trimmed) return null;
+  const params = new URLSearchParams(trimmed);
+  const k = params.get("k");
+  if (k) return k;
+  // Fallback: treat the whole fragment as the key.
+  return trimmed;
 }
 
-/**
- * Imports a raw 256-bit AES-GCM key from base64url-encoded bytes.
- */
-async function importRawAesKey(rawBase64url: string): Promise<CryptoKey> {
-  const raw = base64urlToUint8Array(rawBase64url);
-  return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"]);
+// ─── WebCrypto helpers ────────────────────────────────────────────
+
+async function importAesKey(keyB64Url: string): Promise<CryptoKey> {
+  const raw = base64UrlToBytes(keyB64Url);
+  if (raw.length !== 32) {
+    throw new Error("Invalid AES-256 key length");
+  }
+  return crypto.subtle.importKey(
+    "raw",
+    raw as BufferSource,
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"]
+  );
 }
 
-/**
- * Decrypts an AES-256-GCM ciphertext using the provided CryptoKey.
- */
-async function aesGcmDecrypt(
-  key: CryptoKey,
-  ivBase64url: string,
-  authTagBase64url: string,
-  ciphertextBase64url: string
+async function decryptAesGcm(
+  payload: EncryptedPayload,
+  key: CryptoKey
 ): Promise<string> {
-  const iv = base64urlToUint8Array(ivBase64url);
-  const authTag = base64urlToUint8Array(authTagBase64url);
-  const ciphertext = base64urlToUint8Array(ciphertextBase64url);
-
-  // The Web Crypto API expects ciphertext || authTag concatenated.
-  const combined = new Uint8Array(ciphertext.length + authTag.length);
-  combined.set(ciphertext, 0);
-  combined.set(authTag, ciphertext.length);
-
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv, tagLength: 128 },
+  // WebCrypto expects the auth tag appended to the ciphertext.
+  const ct = base64UrlToBytes(payload.ciphertext);
+  const iv = base64UrlToBytes(payload.iv);
+  const tag = base64UrlToBytes(payload.authTag);
+  const combined = new Uint8Array(ct.length + tag.length);
+  combined.set(ct, 0);
+  combined.set(tag, ct.length);
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: iv as BufferSource },
     key,
-    combined
+    combined as BufferSource
+  );
+  return new TextDecoder().decode(plain);
+}
+
+// ─── Countdown hook ───────────────────────────────────────────────
+
+function useCountdown(destructionMode: DestructionMode, expiresAt: string | null) {
+  const deadline = useMemo(() => {
+    if (destructionMode === "READ_ONCE" || destructionMode === "SCREENSHOT_PROOF") {
+      // 60-second soft countdown for read-once modes.
+      return Date.now() + 60_000;
+    }
+    if (expiresAt) return new Date(expiresAt).getTime();
+    return null;
+  }, [destructionMode, expiresAt]);
+
+  const [remainingMs, setRemainingMs] = useState(
+    deadline ? Math.max(0, deadline - Date.now()) : 0
   );
 
-  return new TextDecoder().decode(decrypted);
+  useEffect(() => {
+    if (!deadline) return;
+    const interval = setInterval(() => {
+      const r = Math.max(0, deadline - Date.now());
+      setRemainingMs(r);
+      if (r <= 0) {
+        clearInterval(interval);
+      }
+    }, 250);
+    return () => clearInterval(interval);
+  }, [deadline]);
+
+  return { remainingMs, hasDeadline: deadline !== null };
 }
 
-// ─── Timer helpers ─────────────────────────────────────────────────────────────
-
-const MODE_DURATIONS_MS: Partial<Record<DestructionMode, number>> = {
-  TIMER_1H: 60 * 60 * 1_000,
-  TIMER_24H: 24 * 60 * 60 * 1_000,
-  TIMER_7D: 7 * 24 * 60 * 60 * 1_000,
-};
-
-function formatCountdown(ms: number): string {
-  if (ms <= 0) return "00:00";
-  const totalSeconds = Math.floor(ms / 1_000);
-  const days = Math.floor(totalSeconds / 86_400);
-  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
-  const minutes = Math.floor((totalSeconds % 3_600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (days > 0) return `${days}d ${hours.toString().padStart(2, "0")}h`;
-  if (hours > 0)
-    return `${hours.toString().padStart(2, "0")}:${minutes
-      .toString()
-      .padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
-  return `${minutes.toString().padStart(2, "0")}:${seconds
-    .toString()
-    .padStart(2, "0")}`;
+function formatRemaining(ms: number): string {
+  if (ms <= 0) return "0s";
+  const s = Math.ceil(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  if (m < 60) return `${m}m ${rs}s`;
+  const h = Math.floor(m / 60);
+  const rm = m % 60;
+  if (h < 24) return `${h}h ${rm}m`;
+  const d = Math.floor(h / 24);
+  const rh = h % 24;
+  return `${d}d ${rh}h`;
 }
 
-// ─── Sub-components ────────────────────────────────────────────────────────────
+// ─── Main component ──────────────────────────────────────────────
 
-const ShredAnimation: FC = () => (
-  <motion.div
-    initial={{ opacity: 0 }}
-    animate={{ opacity: 1 }}
-    exit={{ opacity: 0 }}
-    className="fixed inset-0 z-50 flex flex-col items-center justify-center"
-    style={{ background: "rgba(0,0,0,0.92)" }}
-  >
-    <motion.div
-      initial={{ scaleY: 1 }}
-      animate={{ scaleY: 0, transition: { duration: 1.2, ease: "easeIn" } }}
-      style={{
-        width: 280,
-        height: 200,
-        background: "linear-gradient(180deg,#1e1e1e 0%,#111 100%)",
-        borderRadius: 8,
-        border: "1px solid rgba(255,255,255,0.1)",
-        display: "flex",
-        flexDirection: "column",
-        overflow: "hidden",
-      }}
-    >
-      {Array.from({ length: 12 }).map((_, i) => (
-        <motion.div
-          key={i}
-          initial={{ x: 0 }}
-          animate={{
-            x: [(i % 2 === 0 ? 1 : -1) * (Math.random() * 20 + 5), 0],
-            transition: {
-              repeat: Infinity,
-              duration: 0.08 + Math.random() * 0.06,
-              ease: "linear",
-            },
-          }}
-          style={{
-            flex: 1,
-            background: `rgba(255,255,255,${0.03 + Math.random() * 0.04})`,
-            borderBottom: "1px solid rgba(0,0,0,0.3)",
-          }}
-        />
-      ))}
-    </motion.div>
-    <motion.p
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0, transition: { delay: 0.3 } }}
-      className="mt-6 text-sm font-medium"
-      style={{ color: "#ef4444" }}
-    >
-      Message destroyed
-    </motion.p>
-    <motion.p
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1, transition: { delay: 0.6 } }}
-      className="mt-1 text-xs"
-      style={{ color: "#6b7280" }}
-    >
-      This message no longer exists.
-    </motion.p>
-  </motion.div>
-);
+export function SecureReader(props: SecureReaderProps) {
+  const { messageId, keyOverride, apiBase = "", onDestroyed, onSaveToVault } =
+    props;
 
-const DestroyedScreen: FC<{ at: Date }> = ({ at }) => (
-  <div
-    className="flex flex-col items-center justify-center h-full gap-4"
-    style={{ color: "#9ca3af" }}
-  >
-    <div
-      className="w-16 h-16 rounded-full flex items-center justify-center"
-      style={{ background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.3)" }}
-    >
-      <svg viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth={1.5} className="w-8 h-8">
-        <path
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
-        />
-      </svg>
-    </div>
-    <h2 className="text-lg font-semibold" style={{ color: "#f0f0f0" }}>
-      Message Destroyed
-    </h2>
-    <p className="text-sm text-center max-w-xs">
-      This self-destructing message has been permanently deleted and cannot be
-      recovered.
-    </p>
-    <p className="text-xs" style={{ color: "#4b5563" }}>
-      Destroyed at {at.toLocaleString()}
-    </p>
-  </div>
-);
+  const [phase, setPhase] = useState<Phase>("LOADING");
+  const [errorReason, setErrorReason] = useState<string | null>(null);
+  const [meta, setMeta] = useState<Omit<
+    FetchSuccess,
+    "payload" | "attachments"
+  > | null>(null);
+  const [plaintext, setPlaintext] = useState<string>("");
+  const plaintextRef = useRef<string>("");
+  const keyRef = useRef<string>("");
+  const payloadRef = useRef<EncryptedPayload | null>(null);
+  const hasFetchedRef = useRef(false);
 
-// ─── Main component ────────────────────────────────────────────────────────────
+  const { remainingMs, hasDeadline } = useCountdown(
+    meta?.destructionMode ?? "READ_ONCE",
+    meta?.expiresAt ?? null
+  );
 
-export default function SecureReader({
-  messageId,
-  recipientEmail = "",
-  apiBase = DEFAULT_API_BASE,
-}: SecureReaderProps) {
-  const [state, setState] = useState<ComponentState>({ phase: "idle" });
-  const [countdown, setCountdown] = useState<number | null>(null);
-  const [showShred, setShowShred] = useState(false);
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const expiresAtRef = useRef<number | null>(null);
-
-  // ── Screenshot / print prevention ──────────────────────────────────────────
+  // ─── Anti-screenshot / anti-copy handlers ──────────────────────
 
   useEffect(() => {
-    const isScreenshotProof =
-      state.phase === "ready" && state.screenshotProof;
-
-    if (!isScreenshotProof) return;
-
-    const preventContextMenu = (e: MouseEvent) => e.preventDefault();
-    const preventKeyboard = (e: KeyboardEvent) => {
-      // Block Print (Ctrl+P / Cmd+P), Save (Ctrl+S), Copy (Ctrl+C)
+    if (!meta?.screenshotProof) return;
+    const prevent = (e: Event) => {
+      e.preventDefault();
+      return false;
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
       if (
-        e.key === "p" && (e.ctrlKey || e.metaKey) ||
-        e.key === "s" && (e.ctrlKey || e.metaKey) ||
-        e.key === "c" && (e.ctrlKey || e.metaKey)
+        (e.ctrlKey || e.metaKey) &&
+        (key === "c" || key === "x" || key === "p" || key === "s")
       ) {
         e.preventDefault();
-        e.stopPropagation();
+      }
+      // Print-screen, F12 (devtools)
+      if (key === "printscreen" || key === "f12") {
+        e.preventDefault();
       }
     };
-    const preventBeforePrint = () => {
-      document.body.style.visibility = "hidden";
-    };
-    const restoreAfterPrint = () => {
-      document.body.style.visibility = "visible";
-    };
-
-    document.addEventListener("contextmenu", preventContextMenu);
-    document.addEventListener("keydown", preventKeyboard);
-    window.addEventListener("beforeprint", preventBeforePrint);
-    window.addEventListener("afterprint", restoreAfterPrint);
-
+    document.addEventListener("contextmenu", prevent);
+    document.addEventListener("copy", prevent);
+    document.addEventListener("cut", prevent);
+    document.addEventListener("dragstart", prevent);
+    document.addEventListener("selectstart", prevent);
+    document.addEventListener("keydown", handleKey);
     return () => {
-      document.removeEventListener("contextmenu", preventContextMenu);
-      document.removeEventListener("keydown", preventKeyboard);
-      window.removeEventListener("beforeprint", preventBeforePrint);
-      window.removeEventListener("afterprint", restoreAfterPrint);
+      document.removeEventListener("contextmenu", prevent);
+      document.removeEventListener("copy", prevent);
+      document.removeEventListener("cut", prevent);
+      document.removeEventListener("dragstart", prevent);
+      document.removeEventListener("selectstart", prevent);
+      document.removeEventListener("keydown", handleKey);
     };
-  }, [state]);
+  }, [meta?.screenshotProof]);
 
-  // ── Countdown ticker ────────────────────────────────────────────────────────
+  // ─── Shred helper (wipes plaintext copies) ────────────────────
 
-  const startCountdown = useCallback((expiresAtMs: number) => {
-    expiresAtRef.current = expiresAtMs;
-    setCountdown(Math.max(0, expiresAtMs - Date.now()));
-
-    countdownRef.current = setInterval(() => {
-      const remaining = Math.max(0, (expiresAtRef.current ?? 0) - Date.now());
-      setCountdown(remaining);
-
-      if (remaining <= 0) {
-        if (countdownRef.current) clearInterval(countdownRef.current);
-        // Trigger shred animation then switch to destroyed state.
-        setShowShred(true);
-        setTimeout(() => {
-          setShowShred(false);
-          setState({ phase: "destroyed", at: new Date() });
-        }, 1_800);
-      }
-    }, 1_000);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (countdownRef.current) clearInterval(countdownRef.current);
-    };
-  }, []);
-
-  // ── Fetch & decrypt flow ────────────────────────────────────────────────────
-
-  const loadAndDecrypt = useCallback(async () => {
-    setState({ phase: "loading" });
-
-    let payload: SecureMessagePayload;
-
-    try {
-      const resp = await fetch(`${apiBase}/ephemeral/${messageId}`);
-
-      if (resp.status === 410) {
-        const body = (await resp.json()) as { destroyedAt?: string };
-        setState({
-          phase: "destroyed",
-          at: body.destroyedAt ? new Date(body.destroyedAt) : new Date(),
+  const shred = useCallback(
+    (reason: "COUNTDOWN" | "DISMISS" | "EXTERNAL") => {
+      setPhase("SHREDDING");
+      setPlaintext("");
+      plaintextRef.current = "";
+      keyRef.current = "";
+      payloadRef.current = null;
+      // Best-effort clipboard wipe (ignored if not permitted).
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText("").catch(() => {
+          /* clipboard API refused – non-fatal */
         });
-        return;
       }
-
-      if (!resp.ok) {
-        throw new Error(`Server returned ${resp.status}`);
-      }
-
-      const json = (await resp.json()) as { message: SecureMessagePayload };
-      payload = json.message;
-    } catch (err) {
-      setState({
-        phase: "error",
-        message: err instanceof Error ? err.message : "Failed to fetch message.",
-      });
-      return;
-    }
-
-    if (payload.alreadyDestroyed) {
-      setState({
-        phase: "destroyed",
-        at: payload.destroyedAt ? new Date(payload.destroyedAt) : new Date(),
-      });
-      return;
-    }
-
-    if (!payload.encryptedBlob || !payload.iv || !payload.authTag) {
-      setState({ phase: "error", message: "Message data is incomplete." });
-      return;
-    }
-
-    // Parse decryption key from URL fragment.
-    setState({ phase: "awaiting_key" });
-    const { rawKey } = parseKeyFragment();
-
-    if (!rawKey) {
-      setState({
-        phase: "error",
-        message:
-          "Decryption key not found in URL fragment. Ensure you opened the full secure link.",
-      });
-      return;
-    }
-
-    setState({ phase: "decrypting" });
-
-    try {
-      const cryptoKey = await importRawAesKey(rawKey);
-      const plainHtml = await aesGcmDecrypt(
-        cryptoKey,
-        payload.iv,
-        payload.authTag,
-        payload.encryptedBlob
-      );
-
-      // Compute timer expiry for display.
-      let expiresIn: number | null = null;
-      const durationMs = MODE_DURATIONS_MS[payload.destructionMode];
-      if (durationMs !== undefined) {
-        expiresIn = durationMs; // Approximate; server knows exact expiresAt.
-        startCountdown(Date.now() + durationMs);
-      }
-
-      setState({
-        phase: "ready",
-        plainHtml,
-        subject: payload.subject,
-        mode: payload.destructionMode,
-        screenshotProof: payload.screenshotProof,
-        expiresIn,
-      });
-    } catch (err) {
-      setState({
-        phase: "error",
-        message:
-          "Decryption failed. The key may be invalid or the message may have been tampered with.",
-      });
-    }
-  }, [messageId, apiBase, startCountdown]);
-
-  useEffect(() => {
-    if (state.phase === "idle") {
-      loadAndDecrypt();
-    }
-  }, [state.phase, loadAndDecrypt]);
-
-  // ── Build sandboxed iframe content ──────────────────────────────────────────
-
-  const buildIframeSrcdoc = useCallback(
-    (html: string, isScreenshotProof: boolean): string => {
-      const watermarkStyle = isScreenshotProof
-        ? `
-        body::before {
-          content: '${recipientEmail || "CONFIDENTIAL"}';
-          position: fixed;
-          top: 50%;
-          left: 50%;
-          transform: translate(-50%, -50%) rotate(-30deg);
-          font-size: 48px;
-          font-weight: 700;
-          color: rgba(255,255,255,0.04);
-          white-space: nowrap;
-          pointer-events: none;
-          z-index: 9999;
-          user-select: none;
-        }`
-        : "";
-
-      const preventScripts = isScreenshotProof
-        ? `<script>
-          document.addEventListener('contextmenu', e => e.preventDefault());
-          document.addEventListener('keydown', e => {
-            if ((e.ctrlKey || e.metaKey) && ['p','s','c','a'].includes(e.key)) {
-              e.preventDefault();
-            }
-          });
-        </script>`
-        : "";
-
-      return `<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0; padding: 16px;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-      font-size: 14px;
-      line-height: 1.6;
-      color: #e5e7eb;
-      background: #0a0a0a;
-    }
-    ${
-      isScreenshotProof
-        ? "* { user-select: none !important; -webkit-user-select: none !important; }"
-        : ""
-    }
-    ${watermarkStyle}
-    a { color: #818cf8; }
-    img { max-width: 100%; height: auto; }
-    pre, code { background: rgba(255,255,255,0.06); padding: 2px 6px; border-radius: 4px; }
-  </style>
-</head>
-<body>
-  ${html}
-  ${preventScripts}
-</body>
-</html>`;
+      // Small delay for the shred animation.
+      window.setTimeout(() => {
+        setPhase("DESTROYED");
+        onDestroyed?.();
+      }, reason === "COUNTDOWN" ? 1200 : 600);
     },
-    [recipientEmail]
+    [onDestroyed]
   );
 
-  // ── Render ──────────────────────────────────────────────────────────────────
+  // ─── Auto-shred when countdown hits 0 ─────────────────────────
+
+  useEffect(() => {
+    if (phase !== "READY") return;
+    if (!hasDeadline) return;
+    if (remainingMs > 0) return;
+    shred("COUNTDOWN");
+  }, [phase, hasDeadline, remainingMs, shred]);
+
+  // ─── Initial fetch + decrypt ──────────────────────────────────
+
+  useEffect(() => {
+    if (hasFetchedRef.current) return;
+    hasFetchedRef.current = true;
+
+    const keyB64 =
+      keyOverride ??
+      (typeof window !== "undefined"
+        ? extractKeyFromHash(window.location.hash)
+        : null);
+
+    if (!keyB64) {
+      setErrorReason("MISSING_KEY");
+      setPhase("ERROR");
+      return;
+    }
+
+    keyRef.current = keyB64;
+
+    // Strip the fragment from the URL so a casual shoulder-surfer
+    // won't see the raw key after the page loads.
+    if (typeof window !== "undefined" && !keyOverride) {
+      try {
+        history.replaceState(null, "", window.location.pathname + window.location.search);
+      } catch {
+        /* non-fatal in sandboxed contexts */
+      }
+    }
+
+    (async () => {
+      try {
+        const res = await fetch(`${apiBase}/ephemeral/${encodeURIComponent(messageId)}`, {
+          method: "GET",
+          credentials: "include",
+        });
+        if (!res.ok) {
+          const data = (await res.json().catch(() => ({}))) as FetchFailure;
+          setErrorReason(data.error ?? `HTTP_${res.status}`);
+          setPhase("ERROR");
+          return;
+        }
+        const data = (await res.json()) as FetchSuccess;
+        const { payload, attachments, ...rest } = data;
+        payloadRef.current = payload;
+        // Attachment ciphertext is intentionally not rendered in this
+        // iteration – the SecureReader shows the message body only; a
+        // future pass will surface downloadable encrypted attachments.
+        void attachments;
+        const cryptoKey = await importAesKey(keyB64);
+        const decrypted = await decryptAesGcm(payload, cryptoKey);
+        plaintextRef.current = decrypted;
+        setPlaintext(decrypted);
+        setMeta(rest);
+        setPhase("READY");
+      } catch (err) {
+        setErrorReason(err instanceof Error ? err.message : "DECRYPT_FAILED");
+        setPhase("ERROR");
+      }
+    })();
+  }, [apiBase, keyOverride, messageId]);
+
+  // ─── Save-to-vault button handler ─────────────────────────────
+
+  const handleSaveToVault = useCallback(async () => {
+    if (!meta || !payloadRef.current || !keyRef.current || !onSaveToVault) return;
+    await onSaveToVault({
+      messageId,
+      messageKey: keyRef.current,
+      payload: payloadRef.current,
+      subject: meta.subject,
+    });
+  }, [messageId, meta, onSaveToVault]);
+
+  // ─── Render helpers ───────────────────────────────────────────
+
+  const sandboxedSrcDoc = useMemo(() => {
+    if (phase !== "READY") return "";
+    const screenshotCss = meta?.screenshotProof
+      ? `
+        html, body {
+          user-select: none !important;
+          -webkit-user-select: none !important;
+          -webkit-touch-callout: none !important;
+        }
+        body::after {
+          content: 'QUANTMAIL • CONFIDENTIAL';
+          position: fixed;
+          inset: 0;
+          display: grid;
+          place-items: center;
+          font-size: 48px;
+          color: rgba(148, 163, 184, 0.18);
+          transform: rotate(-30deg);
+          pointer-events: none;
+          letter-spacing: 8px;
+          z-index: 9999;
+        }
+        @media print { body { display: none !important; } }
+      `
+      : "";
+    const escapedBody = escapeHtml(plaintext);
+    return `<!doctype html><html><head><meta charset="utf-8"><style>
+      body {
+        margin: 0;
+        padding: 24px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #0f172a;
+        color: #e2e8f0;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      a { color: #60a5fa; }
+      ${screenshotCss}
+    </style></head><body>${escapedBody}</body></html>`;
+  }, [phase, plaintext, meta?.screenshotProof]);
+
+  // ─── Styles (inline to keep component self-contained) ─────────
+
+  const containerStyle: CSSProperties = {
+    maxWidth: 720,
+    margin: "48px auto",
+    borderRadius: 16,
+    background: "linear-gradient(180deg, #0b1120 0%, #111827 100%)",
+    color: "#e2e8f0",
+    boxShadow: "0 20px 60px rgba(0,0,0,0.45)",
+    overflow: "hidden",
+    position: "relative",
+    fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+  };
+
+  const headerStyle: CSSProperties = {
+    padding: "16px 24px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    borderBottom: "1px solid rgba(148,163,184,0.15)",
+  };
+
+  const countdownStyle: CSSProperties = {
+    fontVariantNumeric: "tabular-nums",
+    fontSize: 13,
+    padding: "4px 10px",
+    borderRadius: 999,
+    background:
+      remainingMs > 0
+        ? "rgba(56,189,248,0.15)"
+        : "rgba(244,63,94,0.15)",
+    color: remainingMs > 0 ? "#38bdf8" : "#fb7185",
+    border: "1px solid rgba(148,163,184,0.2)",
+  };
+
+  const iframeStyle: CSSProperties = {
+    width: "100%",
+    minHeight: 360,
+    border: "none",
+    background: "#0f172a",
+  };
+
+  const footerStyle: CSSProperties = {
+    padding: "12px 24px",
+    display: "flex",
+    gap: 12,
+    justifyContent: "flex-end",
+    borderTop: "1px solid rgba(148,163,184,0.15)",
+  };
+
+  const buttonStyle: CSSProperties = {
+    padding: "8px 14px",
+    borderRadius: 10,
+    border: "1px solid rgba(148,163,184,0.25)",
+    background: "rgba(30,41,59,0.8)",
+    color: "#e2e8f0",
+    cursor: "pointer",
+    fontSize: 13,
+  };
+
+  const shredOverlayStyle: CSSProperties = {
+    position: "absolute",
+    inset: 0,
+    background:
+      "repeating-linear-gradient(180deg, rgba(15,23,42,0.85) 0 6px, rgba(30,41,59,0.55) 6px 12px)",
+    display: "grid",
+    placeItems: "center",
+    color: "#fca5a5",
+    fontSize: 14,
+    letterSpacing: 4,
+    animation: "qm-shred 1.2s ease-in-out forwards",
+  };
+
+  // ─── Render ───────────────────────────────────────────────────
 
   return (
     <div
-      className="relative flex flex-col h-full"
-      style={{ background: "#000", color: "#f0f0f0" }}
+      data-testid="secure-reader"
+      data-phase={phase}
+      style={containerStyle}
+      role="region"
+      aria-label="Self-destructing secure message"
     >
-      <AnimatePresence>
-        {showShred && <ShredAnimation key="shred" />}
-      </AnimatePresence>
+      <style>{`
+        @keyframes qm-shred {
+          0%   { transform: translateY(0);   opacity: 1; }
+          60%  { transform: translateY(6px); opacity: 0.9; }
+          100% { transform: translateY(24px); opacity: 0; }
+        }
+      `}</style>
 
-      {/* Header */}
-      <div
-        className="flex items-center justify-between px-4 py-3 shrink-0"
-        style={{ borderBottom: "1px solid rgba(255,255,255,0.06)" }}
-      >
-        <div className="flex items-center gap-2">
-          <div
-            className="w-2 h-2 rounded-full animate-pulse"
-            style={{ background: "#ef4444" }}
-          />
-          <span className="text-xs font-medium" style={{ color: "#ef4444" }}>
+      <div style={headerStyle}>
+        <div>
+          <div style={{ fontSize: 12, opacity: 0.6, letterSpacing: 2 }}>
             SECURE MESSAGE
-          </span>
+          </div>
+          <div style={{ fontSize: 16, fontWeight: 600 }}>
+            {meta?.subject ?? "Decrypting…"}
+          </div>
         </div>
-
-        {/* Countdown timer */}
-        {countdown !== null && (
-          <motion.div
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            className="flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-semibold"
-            style={{
-              background: countdown < 60_000 ? "rgba(239,68,68,0.15)" : "rgba(255,255,255,0.06)",
-              color: countdown < 60_000 ? "#ef4444" : "#9ca3af",
-              border: `1px solid ${countdown < 60_000 ? "rgba(239,68,68,0.3)" : "rgba(255,255,255,0.1)"}`,
-            }}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="w-3 h-3">
-              <circle cx="12" cy="12" r="9" />
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 7v5l3 3" />
-            </svg>
-            {formatCountdown(countdown)}
-          </motion.div>
+        {phase === "READY" && hasDeadline && (
+          <div style={countdownStyle} aria-live="polite">
+            Self-destructs in {formatRemaining(remainingMs)}
+          </div>
         )}
       </div>
 
-      {/* Body */}
-      <div className="flex-1 overflow-hidden relative">
-        {/* Loading / status screens */}
-        {(state.phase === "loading" ||
-          state.phase === "awaiting_key" ||
-          state.phase === "decrypting") && (
-          <div className="flex flex-col items-center justify-center h-full gap-3">
-            <motion.div
-              animate={{ rotate: 360 }}
-              transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
-              className="w-8 h-8 rounded-full"
-              style={{ border: "2px solid rgba(99,102,241,0.3)", borderTopColor: "#6366f1" }}
-            />
-            <p className="text-sm" style={{ color: "#6b7280" }}>
-              {state.phase === "loading" && "Fetching encrypted message…"}
-              {state.phase === "awaiting_key" && "Locating decryption key…"}
-              {state.phase === "decrypting" && "Decrypting…"}
-            </p>
-          </div>
-        )}
+      {phase === "LOADING" && (
+        <div style={{ padding: 48, textAlign: "center", opacity: 0.7 }}>
+          Unwrapping biometric key…
+        </div>
+      )}
 
-        {state.phase === "error" && (
-          <div className="flex flex-col items-center justify-center h-full gap-3 px-6">
-            <div
-              className="w-12 h-12 rounded-full flex items-center justify-center"
-              style={{ background: "rgba(239,68,68,0.1)" }}
+      {phase === "ERROR" && (
+        <div
+          style={{ padding: 48, textAlign: "center", color: "#fb7185" }}
+          data-testid="secure-reader-error"
+        >
+          This message is unavailable ({errorReason}).
+        </div>
+      )}
+
+      {phase === "READY" && (
+        <iframe
+          title="Decrypted message"
+          data-testid="secure-reader-iframe"
+          sandbox=""
+          srcDoc={sandboxedSrcDoc}
+          style={iframeStyle}
+          referrerPolicy="no-referrer"
+        />
+      )}
+
+      {phase === "SHREDDING" && (
+        <div style={shredOverlayStyle} data-testid="secure-reader-shred">
+          SHREDDING…
+        </div>
+      )}
+
+      {phase === "DESTROYED" && (
+        <div
+          style={{ padding: 48, textAlign: "center", opacity: 0.6 }}
+          data-testid="secure-reader-destroyed"
+        >
+          This message has self-destructed.
+        </div>
+      )}
+
+      {phase === "READY" && (
+        <div style={footerStyle}>
+          {meta?.vaultAllowed && onSaveToVault && (
+            <button
+              type="button"
+              style={buttonStyle}
+              onClick={handleSaveToVault}
+              data-testid="secure-reader-vault"
             >
-              <svg viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth={1.5} className="w-6 h-6">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
-              </svg>
-            </div>
-            <p className="text-sm font-medium" style={{ color: "#f0f0f0" }}>
-              Unable to open message
-            </p>
-            <p className="text-xs text-center" style={{ color: "#6b7280" }}>
-              {state.message}
-            </p>
-          </div>
-        )}
-
-        {state.phase === "destroyed" && <DestroyedScreen at={state.at} />}
-
-        {state.phase === "ready" && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            transition={{ duration: 0.3 }}
-            className="flex flex-col h-full"
+              Save to Vault
+            </button>
+          )}
+          <button
+            type="button"
+            style={buttonStyle}
+            onClick={() => shred("DISMISS")}
+            data-testid="secure-reader-dismiss"
           >
-            {/* Subject */}
-            <div
-              className="px-5 py-3 shrink-0"
-              style={{ borderBottom: "1px solid rgba(255,255,255,0.05)" }}
-            >
-              <h2 className="text-sm font-semibold" style={{ color: "#f0f0f0" }}>
-                {state.subject || "(No subject)"}
-              </h2>
-              <div className="flex items-center gap-2 mt-1">
-                <span
-                  className="text-xs px-2 py-0.5 rounded-full font-medium"
-                  style={{
-                    background: "rgba(239,68,68,0.12)",
-                    color: "#ef4444",
-                    border: "1px solid rgba(239,68,68,0.25)",
-                  }}
-                >
-                  {state.mode === "SCREENSHOT_PROOF"
-                    ? "🛡 Screenshot-Proof"
-                    : state.mode === "READ_ONCE"
-                    ? "👁 Read Once"
-                    : `⏱ ${state.mode.replace("TIMER_", "").toLowerCase()}`}
-                </span>
-                {state.screenshotProof && (
-                  <span
-                    className="text-xs px-2 py-0.5 rounded-full"
-                    style={{ background: "rgba(139,92,246,0.12)", color: "#a78bfa" }}
-                  >
-                    Protected
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {/* READ_ONCE / SCREENSHOT_PROOF self-destruct notice */}
-            {(state.mode === "READ_ONCE" || state.mode === "SCREENSHOT_PROOF") && (
-              <motion.div
-                initial={{ opacity: 0, y: -4 }}
-                animate={{ opacity: 1, y: 0 }}
-                className="mx-4 mt-3 px-3 py-2 rounded-lg text-xs flex items-center gap-2 shrink-0"
-                style={{
-                  background: "rgba(239,68,68,0.08)",
-                  border: "1px solid rgba(239,68,68,0.2)",
-                  color: "#fca5a5",
-                }}
-              >
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="w-3.5 h-3.5 shrink-0">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126z" />
-                </svg>
-                This message has already been delivered to your browser and will self-destruct on the server. Do not close this tab.
-              </motion.div>
-            )}
-
-            {/* Sandboxed iframe */}
-            <div className="flex-1 relative mx-4 my-3 rounded-xl overflow-hidden" style={{ border: "1px solid rgba(255,255,255,0.06)" }}>
-              <iframe
-                ref={iframeRef}
-                srcDoc={buildIframeSrcdoc(state.plainHtml, state.screenshotProof)}
-                sandbox="allow-same-origin"
-                className="w-full h-full"
-                style={{ border: "none", background: "#0a0a0a" }}
-                title="Secure Message Content"
-              />
-              {/* Screenshot-proof watermark overlay (CSS layer outside iframe) */}
-              {state.screenshotProof && (
-                <div
-                  className="absolute inset-0 pointer-events-none"
-                  style={{
-                    backgroundImage: `repeating-linear-gradient(
-                      -45deg,
-                      transparent,
-                      transparent 60px,
-                      rgba(255,255,255,0.015) 60px,
-                      rgba(255,255,255,0.015) 61px
-                    )`,
-                    userSelect: "none",
-                  }}
-                />
-              )}
-            </div>
-          </motion.div>
-        )}
-      </div>
+            Destroy now
+          </button>
+        </div>
+      )}
     </div>
   );
 }
+
+/** Minimal HTML escaper for the sandboxed srcDoc. */
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export default SecureReader;

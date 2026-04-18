@@ -1,53 +1,86 @@
 /**
- * Ephemeral Mail Routes
+ * REST routes for the Self-Destructing Encrypted Messages feature.
  *
- * REST API for the Self-Destructing Encrypted Messages system.
+ *   POST   /ephemeral                       – send an encrypted message
+ *   GET    /ephemeral/:id                   – fetch + apply destruction
+ *   DELETE /ephemeral/:id                   – sender revoke
+ *   GET    /ephemeral/sent                  – list sender's outbox
+ *   GET    /ephemeral/:id/audit             – per-message access audit log
+ *   POST   /ephemeral/sweep                 – admin-only sweeper trigger
  *
- * Endpoints
- * ─────────
- * POST   /ephemeral                       — create a new ephemeral message
- * GET    /ephemeral/inbox/:recipientEmail — list pending messages for recipient
- * GET    /ephemeral/sent/:senderId        — list sent messages for sender
- * GET    /ephemeral/:id                   — open / read a message (may destroy it)
- * DELETE /ephemeral/:id                   — manually destroy a message
- * POST   /ephemeral/:id/revoke-key        — revoke the ECDH key pair for a message
- * GET    /ephemeral/keys/:senderId        — key rotation dashboard data
- * POST   /ephemeral/sweep                 — trigger manual sweep of expired messages
+ *   POST   /key-exchange/pairs              – mint a new ECDH pair
+ *   GET    /key-exchange/pairs              – list user's pairs
+ *   POST   /key-exchange/pairs/:id/rotate   – rotate
+ *   POST   /key-exchange/pairs/:id/revoke   – revoke + cascade-revoke msgs
+ *   GET    /key-exchange/dashboard          – rotation summary
  *
- * Vault endpoints
- * ───────────────
- * POST   /ephemeral/vault                         — add a message to vault
- * GET    /ephemeral/vault/:userId                 — list vault entries (metadata)
- * GET    /ephemeral/vault/:userId/:entryId        — decrypt & return vault entry
- * DELETE /ephemeral/vault/:userId/:entryId        — remove a vault entry
+ *   POST   /vault/unlock-token              – mint biometric unlock token
+ *                                              (caller must already have
+ *                                               verified WebAuthn assertion)
+ *   POST   /vault                           – save a message into the vault
+ *   GET    /vault                           – list entries
+ *   POST   /vault/:id/open                  – read with unlock token
+ *   DELETE /vault/:id                       – remove entry
+ *   GET    /vault/capacity                  – { used, total, remaining }
  */
 
-import { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import {
-  createEphemeralMessage,
-  openEphemeralMessage,
-  destroyEphemeralMessage,
-  sweepExpiredMessages,
-  listMessagesForRecipient,
-  listMessagesBySender,
-} from "../services/EphemeralMailService";
-import {
-  revokeKeyPair,
-  getKeyRotationSummary,
-  listKeyPairsForSender,
-} from "../services/KeyExchangeService";
-import {
-  addToVault,
-  listVaultEntries,
-  decryptVaultEntry,
-  removeVaultEntry,
-  getVaultSize,
-} from "../services/MessageVault";
-import type { DestructionMode } from "../generated/prisma/client";
+  requireAuth,
+  requireAdmin,
+  type AuthenticatedUser,
+} from "../middleware/authMiddleware";
+import * as Ephemeral from "../services/EphemeralMailService";
+import * as KeyExchange from "../services/KeyExchangeService";
+import * as Vault from "../services/MessageVault";
+import { verifyPasskeyAuthentication } from "../services/WebAuthnService";
 
-// ─── Allowed destruction modes ────────────────────────────────────────────────
+type AuthedRequest = FastifyRequest & { user: AuthenticatedUser };
 
-const VALID_DESTRUCTION_MODES: DestructionMode[] = [
+interface SendBody {
+  recipientEmail: string;
+  subject: string;
+  payload: Ephemeral.EncryptedPayload;
+  attachments?: Ephemeral.EncryptedPayload | null;
+  destructionMode: Ephemeral.DestructionMode;
+  vaultAllowed?: boolean;
+  keyAlgorithm?: KeyExchange.SupportedAlgorithm;
+}
+
+interface IdParams {
+  id: string;
+}
+
+interface PairCreateBody {
+  algorithm?: KeyExchange.SupportedAlgorithm;
+  label?: string;
+}
+
+interface VaultPutBody {
+  originalId?: string | null;
+  subject: string;
+  ciphertext: string;
+  iv: string;
+  authTag: string;
+  messageKey: string;
+}
+
+interface VaultOpenBody {
+  unlockToken: string;
+}
+
+interface VaultUnlockTokenBody {
+  /**
+   * Fresh WebAuthn assertion response obtained via
+   * `generatePasskeyAuthenticationOptions` → browser `navigator.credentials.get()`.
+   * The underlying challenge (consumed inside `verifyPasskeyAuthentication`)
+   * has a 5-minute TTL, so this request cryptographically proves the user
+   * performed a biometric gesture within the last few minutes.
+   */
+  assertion: Parameters<typeof verifyPasskeyAuthentication>[1];
+}
+
+const VALID_DESTRUCTION_MODES: Ephemeral.DestructionMode[] = [
   "READ_ONCE",
   "TIMER_1H",
   "TIMER_24H",
@@ -55,328 +88,312 @@ const VALID_DESTRUCTION_MODES: DestructionMode[] = [
   "SCREENSHOT_PROOF",
 ];
 
-function isValidDestructionMode(value: unknown): value is DestructionMode {
-  return (
-    typeof value === "string" &&
-    VALID_DESTRUCTION_MODES.includes(value as DestructionMode)
-  );
-}
-
-// ─── Route registration ───────────────────────────────────────────────────────
-
 export async function ephemeralRoutes(app: FastifyInstance): Promise<void> {
-  /**
-   * POST /ephemeral
-   * Creates a new ephemeral encrypted message.
-   *
-   * Body:
-   *   senderId          string  — UUID of the sender User
-   *   recipientEmail    string  — recipient's email address
-   *   encryptedBlob     string  — base64url AES-256-GCM ciphertext
-   *   iv                string  — base64url 12-byte IV
-   *   authTag           string  — base64url 16-byte GCM auth tag
-   *   subject           string  — (optional) plaintext subject line
-   *   destructionMode   string  — one of VALID_DESTRUCTION_MODES
-   *   senderPublicKey   string  — base64url P-256 public key
-   *   recipientPubKey   string  — (optional) base64url P-256 public key
-   */
-  app.post<{
-    Body: {
-      senderId: string;
-      recipientEmail: string;
-      encryptedBlob: string;
-      iv: string;
-      authTag: string;
-      subject?: string;
-      destructionMode: string;
-      senderPublicKey: string;
-      recipientPubKey?: string;
-    };
-  }>("/ephemeral", async (request, reply) => {
-    const {
-      senderId,
-      recipientEmail,
-      encryptedBlob,
-      iv,
-      authTag,
-      subject,
-      destructionMode,
-      senderPublicKey,
-      recipientPubKey,
-    } = request.body;
+  // ─── Ephemeral message endpoints ────────────────────────────────
 
-    if (
-      !senderId ||
-      !recipientEmail ||
-      !encryptedBlob ||
-      !iv ||
-      !authTag ||
-      !senderPublicKey
-    ) {
-      return reply.code(400).send({
-        error:
-          "senderId, recipientEmail, encryptedBlob, iv, authTag, and senderPublicKey are required.",
-      });
+  app.post<{ Body: SendBody }>(
+    "/ephemeral",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const body = request.body;
+      if (
+        !body ||
+        typeof body.recipientEmail !== "string" ||
+        typeof body.subject !== "string" ||
+        !body.payload ||
+        typeof body.payload.ciphertext !== "string" ||
+        typeof body.payload.iv !== "string" ||
+        typeof body.payload.authTag !== "string"
+      ) {
+        return reply.code(400).send({ error: "Invalid request body" });
+      }
+      if (!VALID_DESTRUCTION_MODES.includes(body.destructionMode)) {
+        return reply
+          .code(400)
+          .send({ error: "Invalid destructionMode", allowed: VALID_DESTRUCTION_MODES });
+      }
+      const auth = (request as AuthedRequest).user;
+      try {
+        const result = await Ephemeral.send({
+          senderUserId: auth.id,
+          recipientEmail: body.recipientEmail,
+          subject: body.subject,
+          payload: body.payload,
+          attachments: body.attachments ?? null,
+          destructionMode: body.destructionMode,
+          vaultAllowed: body.vaultAllowed ?? false,
+          keyAlgorithm: body.keyAlgorithm,
+        });
+        return reply.code(201).send(result);
+      } catch (err) {
+        return reply
+          .code(400)
+          .send({ error: err instanceof Error ? err.message : "send failed" });
+      }
     }
+  );
 
-    if (!isValidDestructionMode(destructionMode)) {
-      return reply.code(400).send({
-        error: `destructionMode must be one of: ${VALID_DESTRUCTION_MODES.join(", ")}`,
-      });
+  app.get<{ Params: IdParams }>("/ephemeral/:id", async (request, reply) => {
+    const { id } = request.params;
+    const result = await Ephemeral.fetchForRead(id, {
+      ipAddress: request.ip,
+      userAgent: request.headers["user-agent"] ?? "",
+    });
+    if (!result.ok) {
+      const status =
+        result.reason === "NOT_FOUND"
+          ? 404
+          : result.reason === "ALREADY_READ" || result.reason === "DESTROYED"
+            ? 410
+            : result.reason === "EXPIRED"
+              ? 410
+              : 403;
+      return reply.code(status).send({ error: result.reason });
     }
-
-    try {
-      const meta = await createEphemeralMessage({
-        senderId,
-        recipientEmail,
-        encryptedBlob,
-        iv,
-        authTag,
-        subject,
-        destructionMode: destructionMode as DestructionMode,
-        senderPublicKey,
-        recipientPubKey,
-      });
-
-      return reply.code(201).send({ message: meta });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      return reply.code(400).send({ error: message });
-    }
+    return reply.send(result);
   });
 
-  /**
-   * GET /ephemeral/inbox/:recipientEmail
-   * Lists all pending (non-destroyed) ephemeral messages for a recipient.
-   * Returns metadata only — no encrypted blobs.
-   */
-  app.get<{ Params: { recipientEmail: string } }>(
-    "/ephemeral/inbox/:recipientEmail",
-    async (request, reply) => {
-      const { recipientEmail } = request.params;
-      const messages = await listMessagesForRecipient(
-        decodeURIComponent(recipientEmail)
-      );
-      return reply.send({ messages });
-    }
-  );
-
-  /**
-   * GET /ephemeral/sent/:senderId
-   * Lists all pending ephemeral messages sent by a user.
-   */
-  app.get<{ Params: { senderId: string } }>(
-    "/ephemeral/sent/:senderId",
-    async (request, reply) => {
-      const { senderId } = request.params;
-      const messages = await listMessagesBySender(senderId);
-      return reply.send({ messages });
-    }
-  );
-
-  /**
-   * GET /ephemeral/:id
-   * Opens an ephemeral message, returning the encrypted blob for client-side
-   * decryption.  READ_ONCE and SCREENSHOT_PROOF messages are destroyed
-   * immediately after this response is sent.
-   */
-  app.get<{ Params: { id: string } }>(
+  app.delete<{ Params: IdParams }>(
     "/ephemeral/:id",
+    { preHandler: requireAuth },
     async (request, reply) => {
-      const { id } = request.params;
-      const result = await openEphemeralMessage(id);
+      const auth = (request as AuthedRequest).user;
+      const ok = await Ephemeral.revokeMessageAndKey(request.params.id, auth.id);
+      if (!ok) return reply.code(404).send({ error: "Not found" });
+      return reply.send({ status: "revoked" });
+    }
+  );
 
-      if (result.alreadyDestroyed) {
-        return reply.code(410).send({
-          error: "This message has been destroyed and is no longer available.",
-          destroyedAt: result.destroyedAt,
+  app.get(
+    "/ephemeral/sent",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const messages = await Ephemeral.listSentMessages(auth.id);
+      return reply.send({ messages });
+    }
+  );
+
+  app.get<{ Params: IdParams }>(
+    "/ephemeral/:id/audit",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const log = await Ephemeral.getDeliveryAuditLog(request.params.id, auth.id);
+      return reply.send({ log });
+    }
+  );
+
+  app.post(
+    "/ephemeral/sweep",
+    { preHandler: requireAdmin },
+    async (_request, reply) => {
+      const purged = await Ephemeral.purgeDestroyed();
+      return reply.send({ purged });
+    }
+  );
+
+  // ─── Key-exchange endpoints ─────────────────────────────────────
+
+  app.post<{ Body: PairCreateBody }>(
+    "/key-exchange/pairs",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const body = request.body ?? {};
+      const pair = await KeyExchange.createPair({
+        ownerUserId: auth.id,
+        algorithm: body.algorithm,
+        label: body.label,
+      });
+      return reply.code(201).send(pair);
+    }
+  );
+
+  app.get(
+    "/key-exchange/pairs",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const pairs = await KeyExchange.listAllPairs(auth.id);
+      return reply.send({ pairs });
+    }
+  );
+
+  app.post<{ Params: IdParams }>(
+    "/key-exchange/pairs/:id/rotate",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const existing = await KeyExchange.getPair(request.params.id);
+      if (!existing || existing.ownerUserId !== auth.id) {
+        return reply.code(404).send({ error: "Not found" });
+      }
+      try {
+        const next = await KeyExchange.rotatePair(request.params.id);
+        return reply.send({ rotated: existing, next });
+      } catch (err) {
+        return reply
+          .code(400)
+          .send({ error: err instanceof Error ? err.message : "rotate failed" });
+      }
+    }
+  );
+
+  app.post<{ Params: IdParams }>(
+    "/key-exchange/pairs/:id/revoke",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const existing = await KeyExchange.getPair(request.params.id);
+      if (!existing || existing.ownerUserId !== auth.id) {
+        return reply.code(404).send({ error: "Not found" });
+      }
+      const result = await KeyExchange.revokePair(request.params.id);
+      return reply.send(result);
+    }
+  );
+
+  app.get(
+    "/key-exchange/dashboard",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const summary = await KeyExchange.rotationDashboard(auth.id);
+      return reply.send(summary);
+    }
+  );
+
+  // ─── Vault endpoints ────────────────────────────────────────────
+
+  /**
+   * Mints a short-lived (5-minute) unlock token.
+   *
+   * Requires a *fresh* WebAuthn assertion in the request body — we run
+   * `verifyPasskeyAuthentication` here, which consumes the pending
+   * challenge.  Because challenges are one-shot and expire in 5
+   * minutes, a stolen long-lived SSO token cannot mint vault unlock
+   * tokens without also performing a new biometric gesture.
+   */
+  app.post<{ Body: VaultUnlockTokenBody }>(
+    "/vault/unlock-token",
+    {
+      preHandler: requireAuth,
+      config: {
+        rateLimit: {
+          max: 5,
+          timeWindow: "1 minute",
+        },
+      },
+    },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const body = request.body;
+      if (!body || !body.assertion) {
+        return reply
+          .code(400)
+          .send({ error: "WebAuthn assertion required" });
+      }
+      if (!auth.verified) {
+        return reply
+          .code(403)
+          .send({ error: "Biometric verification required" });
+      }
+      try {
+        const result = await verifyPasskeyAuthentication(auth.id, body.assertion);
+        if (!result.verified) {
+          return reply.code(403).send({ error: "Biometric gesture rejected" });
+        }
+      } catch (err) {
+        return reply.code(403).send({
+          error: "Biometric gesture rejected",
+          reason: err instanceof Error ? err.message : "verification failed",
         });
       }
-
-      return reply.send({ message: result });
+      const token = Vault.mintUnlockToken(auth.id);
+      return reply.send({ token, expiresInSeconds: 300 });
     }
   );
 
-  /**
-   * DELETE /ephemeral/:id
-   * Manually destroys an ephemeral message (sender-initiated).
-   * Body: { senderId: string }
-   */
-  app.delete<{ Params: { id: string }; Body: { senderId: string } }>(
-    "/ephemeral/:id",
+  app.post<{ Body: VaultPutBody }>(
+    "/vault",
+    { preHandler: requireAuth },
     async (request, reply) => {
-      const { id } = request.params;
-      const { senderId } = request.body ?? {};
-
-      if (!senderId) {
-        return reply.code(400).send({ error: "senderId is required." });
+      const auth = (request as AuthedRequest).user;
+      const body = request.body;
+      if (
+        !body ||
+        typeof body.subject !== "string" ||
+        typeof body.ciphertext !== "string" ||
+        typeof body.iv !== "string" ||
+        typeof body.authTag !== "string" ||
+        typeof body.messageKey !== "string"
+      ) {
+        return reply.code(400).send({ error: "Invalid vault payload" });
       }
-
-      await destroyEphemeralMessage(id);
-      return reply.send({ status: "destroyed" });
+      try {
+        const entry = await Vault.put({
+          ownerUserId: auth.id,
+          originalId: body.originalId ?? null,
+          subject: body.subject,
+          ciphertext: body.ciphertext,
+          iv: body.iv,
+          authTag: body.authTag,
+          messageKeyB64: body.messageKey,
+        });
+        return reply.code(201).send(entry);
+      } catch (err) {
+        return reply
+          .code(400)
+          .send({ error: err instanceof Error ? err.message : "vault put failed" });
+      }
     }
   );
 
-  /**
-   * POST /ephemeral/:id/revoke-key
-   * Revokes the ECDH key pair for an ephemeral message.
-   * After revocation, even a recipient with the URL fragment cannot decrypt.
-   * Body: { senderId: string }
-   */
-  app.post<{ Params: { id: string }; Body: { senderId: string } }>(
-    "/ephemeral/:id/revoke-key",
+  app.get(
+    "/vault",
+    { preHandler: requireAuth },
     async (request, reply) => {
-      const { id } = request.params;
-      const { senderId } = request.body ?? {};
-
-      if (!senderId) {
-        return reply.code(400).send({ error: "senderId is required." });
-      }
-
-      const keyPair = await revokeKeyPair(id);
-      if (!keyPair) {
-        return reply.code(404).send({ error: "Key pair not found." });
-      }
-
-      return reply.send({ keyPair });
+      const auth = (request as AuthedRequest).user;
+      const entries = await Vault.list(auth.id);
+      return reply.send({ entries });
     }
   );
 
-  /**
-   * GET /ephemeral/keys/:senderId
-   * Returns the Key Rotation Dashboard data for a sender.
-   */
-  app.get<{ Params: { senderId: string } }>(
-    "/ephemeral/keys/:senderId",
+  app.post<{ Params: IdParams; Body: VaultOpenBody }>(
+    "/vault/:id/open",
+    { preHandler: requireAuth },
     async (request, reply) => {
-      const { senderId } = request.params;
-      const [summary, keyPairs] = await Promise.all([
-        getKeyRotationSummary(senderId),
-        listKeyPairsForSender(senderId),
-      ]);
-      return reply.send({ summary, keyPairs });
+      const body = request.body;
+      if (!body || typeof body.unlockToken !== "string") {
+        return reply.code(400).send({ error: "unlockToken required" });
+      }
+      const result = await Vault.unlock(request.params.id, body.unlockToken);
+      if (!result) {
+        return reply.code(403).send({ error: "Locked" });
+      }
+      return reply.send(result);
     }
   );
 
-  /**
-   * POST /ephemeral/sweep
-   * Manually triggers a sweep of all expired ephemeral messages.
-   * In production this is handled by a cron job; this endpoint is for
-   * operational use.
-   */
-  app.post("/ephemeral/sweep", async (_request, reply) => {
-    const destroyed = await sweepExpiredMessages();
-    return reply.send({ destroyed });
-  });
-
-  // ─── Vault endpoints ────────────────────────────────────────────────────────
-
-  /**
-   * POST /ephemeral/vault
-   * Saves a message to the authenticated user's vault.
-   *
-   * Body:
-   *   userId          string — UUID of the User
-   *   webAuthnCredId  string — WebAuthn credential ID that unlocks the vault
-   *   senderEmail     string — sender's email address
-   *   subject         string — message subject
-   *   plainContent    string — decrypted message body to be vault-encrypted
-   *   ephemeralMessageId  string? — optional original message ID
-   */
-  app.post<{
-    Body: {
-      userId: string;
-      webAuthnCredId: string;
-      senderEmail: string;
-      subject: string;
-      plainContent: string;
-      ephemeralMessageId?: string;
-    };
-  }>("/ephemeral/vault", async (request, reply) => {
-    const { userId, webAuthnCredId, senderEmail, subject, plainContent, ephemeralMessageId } =
-      request.body;
-
-    if (!userId || !webAuthnCredId || !senderEmail || !subject || !plainContent) {
-      return reply.code(400).send({
-        error:
-          "userId, webAuthnCredId, senderEmail, subject, and plainContent are required.",
-      });
-    }
-
-    const entry = await addToVault({
-      userId,
-      webAuthnCredId,
-      senderEmail,
-      subject,
-      plainContent,
-      ephemeralMessageId,
-    });
-
-    const vaultSize = await getVaultSize(userId);
-    return reply.code(201).send({ entry, vaultSize });
-  });
-
-  /**
-   * GET /ephemeral/vault/:userId
-   * Returns vault entry metadata (no decrypted content) for a user.
-   */
-  app.get<{ Params: { userId: string } }>(
-    "/ephemeral/vault/:userId",
+  app.delete<{ Params: IdParams }>(
+    "/vault/:id",
+    { preHandler: requireAuth },
     async (request, reply) => {
-      const { userId } = request.params;
-      const [entries, vaultSize] = await Promise.all([
-        listVaultEntries(userId),
-        getVaultSize(userId),
-      ]);
-      return reply.send({ entries, vaultSize, maxSize: 100 });
-    }
-  );
-
-  /**
-   * GET /ephemeral/vault/:userId/:entryId
-   * Decrypts and returns the content of a specific vault entry.
-   * Requires the WebAuthn credential ID as a query parameter.
-   *
-   * Query: webAuthnCredId string
-   */
-  app.get<{
-    Params: { userId: string; entryId: string };
-    Querystring: { webAuthnCredId: string };
-  }>("/ephemeral/vault/:userId/:entryId", async (request, reply) => {
-    const { userId, entryId } = request.params;
-    const { webAuthnCredId } = request.query;
-
-    if (!webAuthnCredId) {
-      return reply.code(400).send({ error: "webAuthnCredId query parameter is required." });
-    }
-
-    try {
-      const content = await decryptVaultEntry({ entryId, userId, webAuthnCredId });
-      if (content === null) {
-        return reply.code(404).send({ error: "Vault entry not found." });
-      }
-      return reply.send({ content });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Decryption failed";
-      return reply.code(403).send({ error: message });
-    }
-  });
-
-  /**
-   * DELETE /ephemeral/vault/:userId/:entryId
-   * Removes a vault entry.
-   */
-  app.delete<{ Params: { userId: string; entryId: string } }>(
-    "/ephemeral/vault/:userId/:entryId",
-    async (request, reply) => {
-      const { userId, entryId } = request.params;
-      const removed = await removeVaultEntry(entryId, userId);
-
-      if (!removed) {
-        return reply.code(404).send({ error: "Vault entry not found." });
-      }
-
+      const auth = (request as AuthedRequest).user;
+      const ok = await Vault.remove(request.params.id, auth.id);
+      if (!ok) return reply.code(404).send({ error: "Not found" });
       return reply.send({ status: "removed" });
+    }
+  );
+
+  app.get(
+    "/vault/capacity",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const auth = (request as AuthedRequest).user;
+      const cap = await Vault.capacity(auth.id);
+      return reply.send(cap);
     }
   );
 }
