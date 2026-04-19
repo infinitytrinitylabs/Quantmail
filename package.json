@@ -13,7 +13,13 @@
     "lint": "tsc --noEmit",
     "prisma:generate": "npx prisma generate",
     "prisma:migrate": "npx prisma migrate dev",
-    "deploy": "./deploy.sh"
+    "prisma:studio": "npx prisma studio",
+    "prisma:push": "npx prisma db push",
+    "prisma:seed": "tsx prisma/seed.ts",
+    "prisma:reset": "npx prisma migrate reset",
+    "deploy": "./deploy.sh",
+    "worker:streak": "tsx src/queue/workers/streakMaintenanceWorker.ts",
+    "worker:email": "tsx src/queue/workers/emailWorker.ts"
   },
   "type": "commonjs",
   "dependencies": {
@@ -33,7 +39,7 @@
     "argon2": "^0.44.0",
     "bullmq": "^5.73.0",
     "crypto-js": "^4.2.0",
-    "fastify": "^5.8.4",
+    "fastify": "^5.8.5",
     "ioredis": "^5.10.1",
     "openai": "^6.33.0",
     "pg": "^8.20.0",

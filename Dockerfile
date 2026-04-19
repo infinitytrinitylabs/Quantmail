@@ -3,7 +3,6 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 COPY prisma ./prisma
-COPY prisma.config.ts ./
 RUN npx prisma generate
 COPY tsconfig.json ./
 COPY src ./src
@@ -17,9 +16,8 @@ COPY --from=builder /app/package.json ./
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/src/generated ./src/generated
 
-# PostgreSQL connection string – override at runtime via docker run -e or
-# docker-compose environment section.
-ENV DATABASE_URL="postgresql://quantmail:quantmail@db:5432/quantmail"
+# Production environment - NO default credentials
+# These MUST be overridden at runtime via docker run -e or docker-compose
 ENV NODE_ENV="production"
 ENV PORT="3000"
 

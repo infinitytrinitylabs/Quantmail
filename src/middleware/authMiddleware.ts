@@ -8,8 +8,9 @@
 import { FastifyRequest, FastifyReply } from "fastify";
 import { verifyMasterSSOToken } from "../utils/crypto";
 import { prisma } from "../db";
+import { getRequiredEnv } from "../utils/validateEnv";
 
-const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
+const SSO_SECRET = getRequiredEnv("SSO_SECRET");
 
 /** Shape of the authenticated user attached to the request. */
 export interface AuthenticatedUser {

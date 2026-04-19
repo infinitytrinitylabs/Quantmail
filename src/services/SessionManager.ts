@@ -5,18 +5,22 @@
  * Tracks active sessions per user with device fingerprinting.
  * Supports concurrent session limits and full session revocation.
  *
- * Session store: in-memory Map by default.
- * Set REDIS_URL to enable Redis-backed sessions (via ioredis).
+ * ⚠️  PRODUCTION REQUIREMENT: Sessions and refresh tokens are stored
+ * in-memory by default. For production deployments, you MUST set the
+ * REDIS_URL environment variable to use Redis for session storage.
+ * In-memory storage will NOT work with horizontal scaling or server
+ * restarts.
  */
 
 import { createHmac, randomBytes } from "node:crypto";
 import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../db";
+import { getRequiredEnv } from "../utils/validateEnv";
 
 // ─── Configuration ─────────────────────────────────────────────────
 
-const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
-const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SSO_SECRET = getRequiredEnv("SSO_SECRET");
+const ACCESS_TOKEN_TTL_MS = 15 * 60 * 1000; // 15 minutes (zero-trust requires shorter tokens)
 const REFRESH_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const MAX_SESSIONS_PER_USER = 5;
 
@@ -199,9 +203,9 @@ export async function rotateRefreshToken(
     return null;
   }
 
-  // Verify user agent binding (prevents token theft across devices)
+  // Verify both userAgent AND IP address match the session (prevents token theft)
   if (entry.userAgent && entry.userAgent !== fingerprint.userAgent) {
-    return null;
+    return null; // Device changed - possible session theft
   }
 
   const session = await prisma.userSession.findUnique({
@@ -212,6 +216,26 @@ export async function rotateRefreshToken(
   if (!session || session.revokedAt || session.expiresAt < new Date()) {
     refreshStore.delete(refreshToken);
     return null;
+  }
+
+  // Validate IP address hasn't changed significantly (allows same subnet)
+  if (fingerprint.ip && session.ip && session.ip !== fingerprint.ip) {
+    const storedParts = session.ip.split('.');
+    const currentParts = fingerprint.ip.split('.');
+
+    if (storedParts.length === 4 && currentParts.length === 4) {
+      // Allow if first 3 octets match (same /24 subnet for NAT tolerance)
+      const sameSubnet = storedParts.slice(0, 3).join('.') === currentParts.slice(0, 3).join('.');
+      if (!sameSubnet) {
+        // IP changed significantly - revoke session as precaution
+        await prisma.userSession.update({
+          where: { id: session.id },
+          data: { revokedAt: new Date() },
+        });
+        refreshStore.delete(refreshToken);
+        return null;
+      }
+    }
   }
 
   // Revoke old session

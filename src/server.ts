@@ -34,6 +34,7 @@ import { ephemeralRoutes } from "./routes/ephemeral";
 import { tokenValidatorRoutes } from "./services/TokenValidator";
 import { prisma } from "./db";
 import { landingPage } from "./landing";
+import { validateEnvironment } from "./utils/validateEnv";
 
 function buildHttpsOptions(): { key: string; cert: string; ca?: string } | undefined {
   const keyPath = process.env["TLS_KEY_PATH"];
@@ -73,14 +74,48 @@ const allowedOrigins = process.env["CORS_ORIGINS"]
   : ["http://localhost:3000", "http://localhost:5173"];
 
 async function main(): Promise<void> {
-  await app.register(helmet);
+  // Validate environment variables before starting server
+  const envValidation = validateEnvironment();
+
+  if (!envValidation.valid) {
+    console.error("❌ Environment validation failed:");
+    envValidation.missing.forEach(v => console.error(`  - ${v}`));
+    if (process.env["NODE_ENV"] === "production") {
+      process.exit(1);
+    } else {
+      console.warn("⚠️  Continuing in development mode with validation errors");
+    }
+  }
+
+  if (envValidation.warnings.length > 0) {
+    console.warn("⚠️  Environment warnings:");
+    envValidation.warnings.forEach(w => console.warn(`  - ${w}`));
+  }
+
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        mediaSrc: ["'self'"],
+        frameSrc: ["'none'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  });
+
   await app.register(rateLimit, {
     max: 200,
     timeWindow: "1 minute",
   });
 
   await app.register(cors, {
-    origin: isProduction ? allowedOrigins : true,
+    origin: isProduction ? allowedOrigins : allowedOrigins, // Always use allowlist, even in dev
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,

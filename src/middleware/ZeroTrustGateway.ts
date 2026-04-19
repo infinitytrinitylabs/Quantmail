@@ -40,6 +40,7 @@ declare module "fastify" {
  * Core Zero-Trust gateway preHandler.
  * Validates the access token, verifies the biometric hash claim,
  * and attaches the authenticated context to the request.
+ * Also updates session activity timestamp.
  */
 export async function zeroTrustGateway(
   request: FastifyRequest,
@@ -106,7 +107,15 @@ export async function zeroTrustGateway(
     role: user.role,
     biometricHash: user.biometricHash,
     livenessLevel: payload.livenessLevel,
+    sessionId: payload.jti, // Store session/token ID for touchSession
   };
+
+  // Update session activity timestamp (fire-and-forget)
+  if (payload.jti) {
+    touchSession(payload.jti).catch(() => {
+      // Silent fail - session touch is best-effort
+    });
+  }
 }
 
 /**

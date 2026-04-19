@@ -17,10 +17,11 @@ import {
 } from "../services/WebAuthnService";
 import type { RegistrationResponseJSON, AuthenticationResponseJSON } from "@simplewebauthn/server";
 import { issueSessionTokens } from "../services/SessionManager";
+import { getRequiredEnv, getEnvOrDefault } from "../utils/validateEnv";
 
-const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
-const ENCRYPTION_SECRET =
-  process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+// Require secrets to be set - fail fast if missing in production
+const SSO_SECRET = getRequiredEnv("SSO_SECRET");
+const ENCRYPTION_SECRET = getRequiredEnv("ENCRYPTION_SECRET");
 const AUTH_RATE_LIMIT_MAX = Number(process.env["AUTH_RATE_LIMIT_MAX"] || 5);
 const AUTH_RATE_LIMIT_WINDOW = process.env["AUTH_RATE_LIMIT_WINDOW"] || "1 minute";
 

@@ -10,6 +10,7 @@ import {
   triggerSynchronizedWebBluetoothAlarm,
 } from "../services/criticalAlarmService";
 import { rankInboxMessagesByRelevance } from "../services/inboxRelevanceSync";
+import { requireAuth, requireAdmin } from "../middleware/authMiddleware";
 
 export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -88,11 +89,18 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
    * GET /inbox/:userId
    * Retrieves inbox messages for a user.
+   * PROTECTED: Requires authentication. Users can only access their own inbox.
    */
   app.get<{
     Params: { userId: string };
-  }>("/inbox/:userId", async (request, reply) => {
+  }>("/inbox/:userId", { preHandler: requireAuth }, async (request, reply) => {
     const { userId } = request.params;
+    const authenticatedUser = (request as any).user;
+
+    // Authorization: Users can only access their own inbox
+    if (authenticatedUser.id !== userId) {
+      return reply.code(403).send({ error: "Access denied. You can only access your own inbox." });
+    }
 
     const messages = await prisma.inboxMessage.findMany({
       where: { userId },
@@ -105,8 +113,9 @@ export async function inboxRoutes(app: FastifyInstance): Promise<void> {
   /**
    * GET /inbox/shadow/all
    * Returns all shadow inbox entries (for auditing).
+   * PROTECTED: Admin only - contains sensitive audit information.
    */
-  app.get("/inbox/shadow/all", async (_request, reply) => {
+  app.get("/inbox/shadow/all", { preHandler: requireAdmin }, async (_request, reply) => {
     const entries = await prisma.shadowInbox.findMany({
       orderBy: { droppedAt: "desc" },
     });

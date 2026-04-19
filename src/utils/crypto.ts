@@ -8,6 +8,7 @@ import {
 import CryptoJS from "crypto-js";
 import { v4 as uuidv4 } from "uuid";
 import argon2 from "argon2";
+import { getRequiredEnv } from "./validateEnv";
 
 /**
  * Derives a server-bound biometric hash using HMAC-SHA256.
@@ -19,8 +20,7 @@ import argon2 from "argon2";
  * database index.
  */
 export function deriveBiometricHash(facialMatrixData: string): string {
-  const hmacSecret =
-    process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+  const hmacSecret = getRequiredEnv("ENCRYPTION_SECRET");
   return createHmac("sha256", hmacSecret)
     .update(facialMatrixData)
     .digest("hex");
