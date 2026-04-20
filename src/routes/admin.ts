@@ -11,8 +11,9 @@ import { requireAdmin } from "../middleware/authMiddleware";
 import type { AuthenticatedUser } from "../middleware/authMiddleware";
 import { encryptApiKey } from "../utils/crypto";
 import { maskStoredKey } from "../utils/maskKey";
+import { getRequiredEnv } from "../utils/validateEnv";
 
-const ENCRYPTION_SECRET = process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+const ENCRYPTION_SECRET = getRequiredEnv("ENCRYPTION_SECRET");
 
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
   app.get("/admin/stats", {

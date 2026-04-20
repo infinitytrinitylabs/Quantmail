@@ -2,10 +2,10 @@ import { FastifyInstance } from "fastify";
 import { prisma } from "../db";
 import { verifyMasterSSOToken, encryptApiKey } from "../utils/crypto";
 import { maskStoredKey } from "../utils/maskKey";
+import { getRequiredEnv } from "../utils/validateEnv";
 
-const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
-const ENCRYPTION_SECRET =
-  process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+const SSO_SECRET = getRequiredEnv("SSO_SECRET");
+const ENCRYPTION_SECRET = getRequiredEnv("ENCRYPTION_SECRET");
 
 export async function settingsRoutes(app: FastifyInstance): Promise<void> {
   /**

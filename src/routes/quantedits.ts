@@ -16,10 +16,11 @@ import {
   type SaccadeSample,
 } from "../services/saccadeLivenessService";
 import { verifyMasterSSOToken } from "../utils/crypto";
+import { getRequiredEnv } from "../utils/validateEnv";
 import { v4 as uuidv4 } from "uuid";
 import CryptoJS from "crypto-js";
 
-const SSO_SECRET = process.env["SSO_SECRET"] || "quantmail-dev-secret";
+const SSO_SECRET = getRequiredEnv("SSO_SECRET");
 
 /** Simple in-memory rate limiter for quantedits endpoints. */
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
