@@ -32,6 +32,8 @@ import { streakRoutes } from "./routes/streak";
 import { smartComposeRoutes } from "./routes/smartCompose";
 import { ephemeralRoutes } from "./routes/ephemeral";
 import { tokenValidatorRoutes } from "./services/TokenValidator";
+import { intentRoutes } from "./routes/intent";
+import { focusFlowRoutes } from "./routes/focus";
 import { prisma } from "./db";
 import { landingPage } from "./landing";
 import { validateEnvironment } from "./utils/validateEnv";
@@ -168,6 +170,8 @@ async function main(): Promise<void> {
   await app.register(smartComposeRoutes);
   await app.register(ephemeralRoutes);
   await app.register(tokenValidatorRoutes);
+  await app.register(intentRoutes);
+  await app.register(focusFlowRoutes);
   await app.register(profileRoutes);
 
   app.get(
