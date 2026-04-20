@@ -1,5 +1,6 @@
 import { prisma } from "../db";
 import { decryptApiKey } from "./crypto";
+import { getRequiredEnv } from "./validateEnv";
 
 /** Supported AI provider identifiers. */
 export type AIProvider = "openai" | "anthropic" | "gemini" | "custom";
@@ -14,8 +15,13 @@ export interface ResolvedAIKey {
   customModelUrl?: string;
 }
 
-const ENCRYPTION_SECRET =
-  process.env["ENCRYPTION_SECRET"] || "quantmail-key-secret";
+const getEncryptionSecret = () => {
+  // In test environment, allow the test-provided value
+  if (process.env["NODE_ENV"] === "test" && process.env["ENCRYPTION_SECRET"]) {
+    return process.env["ENCRYPTION_SECRET"];
+  }
+  return getRequiredEnv("ENCRYPTION_SECRET");
+};
 
 /**
  * Resolves the API key to use for a given AI provider and user.
@@ -49,7 +55,7 @@ export async function resolveAIKey(
   if (user) {
     const encryptedUserKey = getUserKeyField(user, provider);
     if (encryptedUserKey) {
-      const plaintext = decryptApiKey(encryptedUserKey, ENCRYPTION_SECRET);
+      const plaintext = decryptApiKey(encryptedUserKey, getEncryptionSecret());
       if (plaintext) {
         if (provider === "custom") {
           const customUrl = user.customModelUrl ?? undefined;
@@ -68,7 +74,7 @@ export async function resolveAIKey(
   if (adminConfig) {
     const encryptedAdminKey = getAdminKeyField(adminConfig, provider);
     if (encryptedAdminKey) {
-      const plaintext = decryptApiKey(encryptedAdminKey, ENCRYPTION_SECRET);
+      const plaintext = decryptApiKey(encryptedAdminKey, getEncryptionSecret());
       if (plaintext) {
         if (provider === "custom") {
           const customUrl = adminConfig.customModelUrl ?? undefined;
